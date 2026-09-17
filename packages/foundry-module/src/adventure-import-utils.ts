@@ -325,20 +325,35 @@ export function collectionHasId(collection: any, id: string): boolean {
   return !!collection.invalidDocumentIds?.has?.(id);
 }
 
+/** A serial lock (see createSerialLock). */
+export interface SerialLock {
+  <T>(job: () => Promise<T>): Promise<T>;
+  /** How many jobs are queued or running right now (board #1724: a world reload must not cut off queued calls). */
+  pending(): number;
+}
+
 /**
  * A lock that runs async jobs one at a time, in call order (a promise chain). adventure-import and
  * adventure-source-backfill apply both plan from live state and then write, so two calls handled
  * by the same Foundry client must not interleave between the plan and the write (board #1714
  * review). A job that throws does not block the jobs after it. It does not protect against a
- * second GM client running its own bridge module at the same time.
+ * second GM client running its own bridge module at the same time. Board #1724: the aidm-module-*
+ * tools share this same lock, and pending() counts the jobs queued or running.
  */
-export function createSerialLock(): <T>(job: () => Promise<T>) => Promise<T> {
+export function createSerialLock(): SerialLock {
   let tail: Promise<unknown> = Promise.resolve();
-  return <T>(job: () => Promise<T>): Promise<T> => {
+  let count = 0;
+  const lock = (<T>(job: () => Promise<T>): Promise<T> => {
+    count += 1;
     const run = tail.then(() => job());
-    tail = run.catch(() => undefined);
+    const done = () => {
+      count -= 1;
+    };
+    tail = run.then(done, done);
     return run;
-  };
+  }) as SerialLock;
+  lock.pending = () => count;
+  return lock;
 }
 
 /** Every world document carrying the aidm source tags for this exact pack + source scene id. */

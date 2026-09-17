@@ -22,6 +22,7 @@ import { CompendiumTools } from './tools/compendium.js';
 
 import { SceneTools } from './tools/scene.js';
 import { SceneManagementTools } from './tools/scene-management.js';
+import { AidmModuleTools } from './tools/aidm-module.js';
 import { WallLightingTools } from './tools/wall-lighting.js';
 import { UserManagementTools } from './tools/user-management.js';
 
@@ -1196,6 +1197,8 @@ async function startBackend(): Promise<void> {
 
   const sceneTools = new SceneTools({ foundryClient, logger });
   const sceneManagementTools = new SceneManagementTools({ foundryClient, logger });
+  // Board #1724: install / update / remove an imported book's Foundry module (operator tools).
+  const aidmModuleTools = new AidmModuleTools({ foundryClient, logger });
   const wallLightingTools = new WallLightingTools({ foundryClient, logger });
   const userManagementTools = new UserManagementTools({ foundryClient, logger });
 
@@ -1428,6 +1431,7 @@ async function startBackend(): Promise<void> {
 
     ...sceneTools.getToolDefinitions(),
     ...sceneManagementTools.getToolDefinitions(),
+    ...aidmModuleTools.getToolDefinitions(),
     ...wallLightingTools.getToolDefinitions(),
     ...userManagementTools.getToolDefinitions(),
 
@@ -1814,6 +1818,18 @@ async function startBackend(): Promise<void> {
 
                 case 'adventure-source-backfill':
                   result = await sceneManagementTools.handleAdventureSourceBackfill(args);
+
+                  break;
+
+                // Board #1724: an imported book's own Foundry module (operator tools)
+
+                case 'aidm-module-status':
+                case 'aidm-module-enable':
+                case 'aidm-module-disable':
+                case 'aidm-module-install':
+                case 'aidm-module-update':
+                case 'aidm-module-remove':
+                  result = await aidmModuleTools.handleToolCall(name, args);
 
                   break;
 

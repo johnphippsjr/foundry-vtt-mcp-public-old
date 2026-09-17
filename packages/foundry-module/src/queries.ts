@@ -36,6 +36,7 @@ import {
   type CombatToken,
 } from './combat-scoping-utils.js';
 import { staleCombatIdsToDelete } from './combat-cleanup-utils.js';
+import { AidmModuleHandlers } from './aidm-module-handlers.js';
 
 // Board #1714 review: adventure-import and adventure-source-backfill apply both plan from live
 // state and then write. This module-level lock makes those calls run one at a time INSIDE THIS ONE
@@ -44,15 +45,27 @@ import { staleCombatIdsToDelete } from './combat-cleanup-utils.js';
 // cannot be cancelled: a call the MCP side already gave up on (its 60 s query timeout) still runs
 // when its turn comes. If a queued call's Foundry request never settles, later calls wait behind it
 // until the page is reloaded.
+// Board #1724: the aidm-module-* tools (install, update, remove, enable, disable) share this lock.
 const adventureWriteLock = createSerialLock();
 
 export class QueryHandlers {
   public dataAccess: FoundryDataAccess;
   private comfyuiManager: ComfyUIManager;
+  private aidmModules: AidmModuleHandlers;
 
   constructor() {
     this.dataAccess = new FoundryDataAccess();
     this.comfyuiManager = new ComfyUIManager();
+    // Board #1724: install, update and remove an imported book's Foundry module (aidm-module-*).
+    this.aidmModules = new AidmModuleHandlers({
+      lock: adventureWriteLock,
+      isGM: () => this.validateGMAccess().allowed,
+      rollbackCreated: created => this._rollbackCreatedDocuments(created),
+      savedAfterFailedCreate: (cls, collection, id) =>
+        this._savedAfterFailedCreate(cls, collection, id),
+      resolveSceneRefs: scenes => this._resolveSceneRefs(scenes),
+      missingActorIds: scenes => this._missingActorIds(scenes),
+    });
   }
 
   /**
@@ -95,6 +108,15 @@ export class QueryHandlers {
     CONFIG.queries[`${modulePrefix}.scene-integrity`] = this.handleSceneIntegrity.bind(this);
     CONFIG.queries[`${modulePrefix}.adventure-source-backfill`] =
       this.handleAdventureSourceBackfill.bind(this);
+
+    // Board #1724: an imported book's own Foundry module (install / update / remove). GM-only,
+    // one write at a time (adventureWriteLock), hidden from the DM model by the brain.
+    CONFIG.queries[`${modulePrefix}.aidm-module-status`] = this.handleAidmModuleStatus.bind(this);
+    CONFIG.queries[`${modulePrefix}.aidm-module-enable`] = this.handleAidmModuleEnable.bind(this);
+    CONFIG.queries[`${modulePrefix}.aidm-module-disable`] = this.handleAidmModuleDisable.bind(this);
+    CONFIG.queries[`${modulePrefix}.aidm-module-install`] = this.handleAidmModuleInstall.bind(this);
+    CONFIG.queries[`${modulePrefix}.aidm-module-update`] = this.handleAidmModuleUpdate.bind(this);
+    CONFIG.queries[`${modulePrefix}.aidm-module-remove`] = this.handleAidmModuleRemove.bind(this);
 
     // Phase E wall/lighting queries (audited gap: no wall/light tools existed anywhere in the
     // fork before this). Same batched-embedded-document pattern as addActorsToScene/createTokens.
@@ -3879,6 +3901,31 @@ export class QueryHandlers {
         error: String((e && (e.stack || e.message)) || e),
       };
     }
+  }
+
+  // ---- aidm-module-* (board #1724): see aidm-module-handlers.ts. ----
+  private async handleAidmModuleStatus(data: any): Promise<any> {
+    return await this.aidmModules.status(data);
+  }
+
+  private async handleAidmModuleEnable(data: any): Promise<any> {
+    return await this.aidmModules.setEnabled(data, true);
+  }
+
+  private async handleAidmModuleDisable(data: any): Promise<any> {
+    return await this.aidmModules.setEnabled(data, false);
+  }
+
+  private async handleAidmModuleInstall(data: any): Promise<any> {
+    return await this.aidmModules.install(data);
+  }
+
+  private async handleAidmModuleUpdate(data: any): Promise<any> {
+    return await this.aidmModules.update(data);
+  }
+
+  private async handleAidmModuleRemove(data: any): Promise<any> {
+    return await this.aidmModules.remove(data);
   }
 
   // Read-only counterpart (item E, board #1311): reports the same {unresolved:{scene_refs,
