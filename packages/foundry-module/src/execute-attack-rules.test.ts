@@ -591,3 +591,202 @@ describe('unchanged behaviour (guards)', () => {
     expect(rollCalls).toHaveLength(1);
   });
 });
+
+// ================================================================================================
+// Board #1887, operator decision 2026-09-27 "Unarmed Strike": a monster with no weapon left makes an
+// Unarmed Strike, rolled with dnd5e's OWN item (Compendium.dnd5e.equipment24.Item.phbUnarmedStrike for
+// the 2024 rules), never added to the monster. The stand-in below follows what the test stack measured
+// on 2026-09-27 for a Kobold Warrior (Str 7, PB 2): before dnd5e's final item preparation the attack
+// was `1d20 - 2` (no proficiency) and no damage was rolled; after it, `1d20 - 2 + 2` and `1 - 2`
+// bludgeoning. dnd5e only remembers the last attack mode on an item its actor holds.
+// ================================================================================================
+let uuidAsked: string[] = [];
+let unarmedLoads = true;
+
+class FakeItem5e {
+  id: string;
+  name: string;
+  type: string;
+  flags: any = {};
+  isOwner = true;
+  inCompendium = false;
+  effects: any[] = [];
+  parent: any;
+  prepared = false;
+  system: any;
+  constructor(data: any, opts: any = {}) {
+    this.id = data._id;
+    this.name = data.name;
+    this.type = data.type;
+    this.parent = opts.parent;
+    const item = this;
+    const activity: any = {
+      id: 'X96HnXRaVti0SXqJ',
+      type: 'attack',
+      actionType: 'mwak',
+      attack: { ability: 'str' },
+      item,
+      async rollAttack(config: any = {}) {
+        const die = d20Queue.length ? d20Queue.shift()! : 10;
+        const prof = item.prepared ? 2 : 0;
+        const roll = {
+          formula: item.prepared ? '1d20 - 2 + 2' : '1d20 - 2',
+          total: die - 2 + prof,
+          isCritical: die === 20,
+          isFumble: die === 1,
+          options: { attackMode: config.attackMode ?? 'oneHanded' },
+        };
+        // dnd5e 5.3.3: `this.actor.items.has(this.item.id)` guards the remembered-mode write.
+        if (item.parent?.items?.has?.(item.id))
+          setProperty(item.flags, `dnd5e.last.${activity.id}.attackMode`, roll.options.attackMode);
+        rollCalls.push({
+          config: { ...config },
+          mode: roll.options.attackMode,
+          prepared: item.prepared,
+        });
+        return [roll];
+      },
+      async rollDamage(config: any = {}) {
+        damageCalls.push({ ...config });
+        if (!item.prepared) return null;
+        return [{ total: -1, formula: '1 - 2', options: { type: 'bludgeoning' }, terms: [] }];
+      },
+    };
+    this.system = {
+      quantity: 1,
+      range: { value: null, long: null, reach: null, units: 'ft' },
+      properties: new Set(),
+      attackModes: [{ value: 'oneHanded' }],
+      type: { value: 'natural' },
+      level: 0,
+      activities: new ValueCollection([activity]),
+    };
+  }
+  getFlag(scope: string, key: string) {
+    return getProperty(this.flags, `${scope}.${key}`);
+  }
+  prepareFinalAttributes() {
+    this.prepared = true;
+  }
+}
+
+function withDnd5eUnarmedStrike() {
+  const g: any = globalThis;
+  g.fromUuid = async (uuid: string) => {
+    uuidAsked.push(uuid);
+    if (!unarmedLoads) return null;
+    return {
+      toObject: () => ({
+        _id: uuid.endsWith('phbUnarmedStrike') ? 'phbUnarmedStrike' : 'GsuvwoekKZatfKwF',
+        name: 'Unarmed Strike',
+        type: 'weapon',
+      }),
+    };
+  };
+  g.CONFIG = { Item: { documentClass: FakeItem5e } };
+}
+
+describe('no weapon left: an Unarmed Strike, the dnd5e way (operator "Unarmed Strike")', () => {
+  beforeEach(() => {
+    uuidAsked = [];
+    unarmedLoads = true;
+    const g: any = globalThis;
+    delete g.fromUuid;
+    delete g.CONFIG;
+  });
+
+  it("uses dnd5e's own 2024 Unarmed Strike, fully prepared, and adds nothing to the monster", async () => {
+    const { kobold } = world({ targetFeet: 5, dagger: makeDagger(0) });
+    withDnd5eUnarmedStrike();
+    d20Queue = [18]; // 18 - 2 + 2 = 18 hits AC 16
+    const res = await attack('Unarmed Strike');
+    expect(uuidAsked).toEqual(['Compendium.dnd5e.equipment24.Item.phbUnarmedStrike']);
+    expect(res.success).toBe(true);
+    expect(res.item).toBe('Unarmed Strike');
+    expect(rollCalls).toHaveLength(1);
+    expect(rollCalls[0].prepared).toBe(true); // Str + proficiency, as dnd5e prepares it
+    expect(rollCalls[0].config.attackMode).toBe('oneHanded');
+    const r = res.results[0];
+    expect(r.unarmed).toBe(true);
+    expect(r.formula).toBe('1d20 - 2 + 2');
+    expect(r.hit).toBe(true);
+    expect(r.thrown).toBe(false);
+    // the monster keeps exactly what it had: one used-up Dagger, no new item, no remembered mode written
+    expect([...kobold.items.keys()]).toEqual(['itemDagger']);
+    expect(kobold.items.get('itemDagger').system.quantity).toBe(0);
+  });
+
+  it('a hit whose damage roll is below 0 deals 0 and never heals the target', async () => {
+    const { brakka } = world({ targetFeet: 5, dagger: makeDagger(0) });
+    withDnd5eUnarmedStrike();
+    d20Queue = [18]; // 18 - 2 + 2 = 18 hits AC 16
+    const res = await attack('Unarmed Strike');
+    const r = res.results[0];
+    expect(r.hit).toBe(true);
+    expect(r.damageRolled).toBe(-1);
+    expect(r.damageApplied).toBe(0);
+    expect(r.damage).toBe(0);
+    expect(brakka.system.attributes.hp.value).toBe(20);
+  });
+
+  it("a 2014-rules world uses dnd5e's 2014 Unarmed Strike", async () => {
+    world({ targetFeet: 5, dagger: makeDagger(0) });
+    withDnd5eUnarmedStrike();
+    const g: any = globalThis;
+    const midiGet = g.game.settings.get;
+    g.game.settings.get = (scope: string, name: string) =>
+      scope === 'dnd5e' && name === 'rulesVersion' ? 'legacy' : midiGet(scope, name);
+    const res = await attack('Unarmed Strike');
+    expect(uuidAsked).toEqual(['Compendium.dnd5e.items.Item.GsuvwoekKZatfKwF']);
+    expect(res.results[0].unarmed).toBe(true);
+  });
+
+  it("dnd5e's item cannot be loaded: an error that says so, and nothing is rolled", async () => {
+    world({ targetFeet: 5, dagger: makeDagger(0) });
+    withDnd5eUnarmedStrike();
+    unarmedLoads = false;
+    await expect(attack('Unarmed Strike')).rejects.toThrow(
+      /Item not found on attacker: Unarmed Strike \(dnd5e's own Unarmed Strike could not be loaded/
+    );
+    expect(rollCalls).toHaveLength(0);
+  });
+
+  it('guard (unchanged): a creature with its own Unarmed Strike item uses that item', async () => {
+    const own = makeWeapon({
+      name: 'Unarmed Strike',
+      quantity: 1,
+      range: { value: null, long: null, reach: 5 },
+      properties: [],
+      attackModes: [{ value: 'oneHanded' }],
+    });
+    world({ targetFeet: 5, dagger: own, attackerItems: [own] });
+    withDnd5eUnarmedStrike();
+    const res = await attack('Unarmed Strike');
+    expect(uuidAsked).toEqual([]);
+    expect(res.results[0].unarmed).toBeUndefined();
+    expect(rollCalls[0].config.attackMode).toBe('oneHanded');
+  });
+
+  it('guard (unchanged): any other missing item is still "Item not found"', async () => {
+    world({ targetFeet: 5 });
+    withDnd5eUnarmedStrike();
+    await expect(attack('Longsword')).rejects.toThrow('Item not found on attacker: Longsword');
+    expect(uuidAsked).toEqual([]);
+  });
+});
+
+describe("damage below 0 deals 0 for every weapon (dnd5e's own rule when it applies damage)", () => {
+  it('a Dagger damage roll of -1 leaves the target untouched (it used to heal 1)', async () => {
+    const dagger = makeDagger(1);
+    dagger.system.activities.contents[0].rollDamage = async (config: any = {}) => {
+      damageCalls.push({ ...config });
+      return [{ total: -1, options: { type: 'piercing' }, terms: [] }];
+    };
+    const { brakka } = world({ targetFeet: 5, dagger });
+    d20Queue = [15];
+    const res = await attack();
+    expect(res.results[0].hit).toBe(true);
+    expect(res.results[0].damageApplied).toBe(0);
+    expect(brakka.system.attributes.hp.value).toBe(20);
+  });
+});

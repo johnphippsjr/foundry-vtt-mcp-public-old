@@ -120,6 +120,57 @@ export function weaponUsedUp(item: { type?: string; quantity?: unknown }): boole
   return item?.type === 'weapon' && typeof item.quantity === 'number' && item.quantity <= 0;
 }
 
+/**
+ * dnd5e 5.3.3's OWN Unarmed Strike items, in the compendia the system ships (board #1887, operator decision
+ * 2026-09-27 "Unarmed Strike": a monster with no weapon left makes an Unarmed Strike).
+ *
+ * The rules (PHB 2024, "Unarmed Strike"): every creature can make one; the attack roll adds the Strength modifier and
+ * the Proficiency Bonus, and a hit deals Bludgeoning damage equal to 1 plus the Strength modifier. dnd5e 5.3.3 models
+ * exactly that as a weapon item: `equipment24` `phbUnarmedStrike` (SRD 5.2, the 2024 rules; type `natural`,
+ * `proficient: 1`, an attack activity with `ability: 'str'`, damage bonus `1 + @mod` bludgeoning), and the 2014 one in
+ * the SRD 5.1 `items` pack (damage `1 + @mod`). The 2024 character premades get it by an ItemGrant of that uuid. A
+ * monster's stat block never includes it, so execute-attack uses the system's own item, never a formula of ours.
+ * Measured on the dnd-dm test stack (Kobold Warrior, Str 7, PB 2): attack `1d20 - 2 + 2`, damage `1 - 2`.
+ */
+export const UNARMED_STRIKE_UUID = {
+  modern: 'Compendium.dnd5e.equipment24.Item.phbUnarmedStrike',
+  legacy: 'Compendium.dnd5e.items.Item.GsuvwoekKZatfKwF',
+} as const;
+
+/** Is this the name of the Unarmed Strike every creature can make? */
+export function isUnarmedStrike(name: unknown): boolean {
+  return typeof name === 'string' && name.trim().toLowerCase() === 'unarmed strike';
+}
+
+/** Which of dnd5e's own Unarmed Strike items a world uses: its `dnd5e.rulesVersion` setting (`modern` is dnd5e's
+ * default; `legacy` is the 2014 rules). */
+export function unarmedStrikeUuid(rulesVersion: unknown): string {
+  return rulesVersion === 'legacy' ? UNARMED_STRIKE_UUID.legacy : UNARMED_STRIKE_UUID.modern;
+}
+
+export interface DamagePart {
+  total: number | null | undefined;
+  type?: string | null | undefined;
+}
+
+/**
+ * The damage dnd5e applies for a set of damage rolls: the rolls summed per damage type, and a type whose total is
+ * below 0 counts as 0. That is dnd5e 5.3.3's own rule when it applies damage from its chat card
+ * (`ChatMessage5e#applyChatCardDamage` and the card's damage application: `Math.max(0, roll.total)` per aggregated
+ * roll). `Actor5e#applyDamage` itself has no floor: handed a negative number it HEALS. Measured on the test stack: a
+ * Kobold Warrior's Unarmed Strike (Str 7) rolls `1 - 2` = -1, which must apply as 0, not heal the target by 1.
+ */
+export function appliedDamage(parts: DamagePart[]): number {
+  const byType = new Map<string, number>();
+  for (const p of parts || []) {
+    const k = String(p?.type ?? '');
+    byType.set(k, (byType.get(k) ?? 0) + (Number(p?.total) || 0));
+  }
+  let sum = 0;
+  for (const v of byType.values()) sum += Math.max(0, v);
+  return sum;
+}
+
 export interface RangeRefusalInput {
   targetName: string;
   itemName: string;

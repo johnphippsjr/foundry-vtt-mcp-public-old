@@ -42,6 +42,9 @@ import {
   rangeRollAdvantage,
   weaponUsedUp,
   describeRangeRefusal,
+  isUnarmedStrike,
+  unarmedStrikeUuid,
+  appliedDamage,
 } from './attack-rules-utils.js';
 
 // Board #1714 review: adventure-import and adventure-source-backfill apply both plan from live
@@ -2487,10 +2490,24 @@ export class QueryHandlers {
     const actor = attTok.actor;
     if (!actor) throw new Error('Attacker has no actor');
     const itemLower = String(data.item).toLowerCase();
-    const item =
+    let item =
       actor.items.find(
         (i: any) => i.name?.toLowerCase() === itemLower && i.system?.activities?.size
       ) || actor.items.find((i: any) => i.name?.toLowerCase() === itemLower);
+    // Board #1887 (operator decision 2026-09-27 "Unarmed Strike"): every creature can make an Unarmed Strike, but a
+    // monster's stat block never carries the item. When the attacker has none of its own, the attack uses dnd5e's
+    // OWN Unarmed Strike (its compendium item for the world's rules version) as a temporary copy owned by the
+    // attacker: dnd5e's roll machinery works out the numbers (Str + proficiency to hit, 1 + Str bludgeoning), and
+    // nothing is added to the monster.
+    let unarmed = false;
+    if (!item && isUnarmedStrike(data.item)) {
+      item = await this._unarmedStrikeFor(actor);
+      if (!item)
+        throw new Error(
+          `Item not found on attacker: ${data.item} (dnd5e's own Unarmed Strike could not be loaded from its compendium)`
+        );
+      unarmed = true;
+    }
     if (!item) throw new Error('Item not found on attacker: ' + data.item);
     const activities = [...((item.system.activities as any) || [])];
     const activity = activities.find((a: any) => a.type === 'attack') || activities[0];
@@ -2830,6 +2847,7 @@ export class QueryHandlers {
           hit = false,
           formula: string | null = null;
         let damage = 0,
+          damageApplied = 0,
           damageType: string | null = null,
           hpAfter = hpBefore,
           error: string | null = null;
@@ -2847,26 +2865,37 @@ export class QueryHandlers {
               { configure: false },
               {}
             );
-            const rolls = Array.isArray(dr) ? dr : [dr];
-            damage = rolls.reduce((s: number, r: any) => s + (r?.total || 0), 0);
+            const rolls = (Array.isArray(dr) ? dr : [dr]).filter(Boolean);
             damageType = rolls[0]?.options?.type || rolls[0]?.options?.flavor || 'none';
+            // Each roll's total, with the critical dice added to the roll they belong to.
+            const parts = rolls.map((r: any) => ({
+              total: Number(r?.total) || 0,
+              type: r?.options?.type ?? null,
+            }));
             if (crit) {
               const RollCls: any =
                 (globalThis as any).foundry?.dice?.Roll || (globalThis as any).Roll;
-              for (const r of rolls)
+              for (let ri = 0; ri < rolls.length; ri++) {
+                const r = rolls[ri];
                 for (const term of (r && r.terms) || []) {
                   if (term && term.faces && term.number) {
                     try {
                       const er = new RollCls(`${term.number}d${term.faces}`);
                       await er.evaluate();
-                      damage += er.total;
+                      const part = parts[ri];
+                      if (part) part.total += er.total;
                     } catch (e) {
                       /* ignore */
                     }
                   }
                 }
+              }
             }
-            await t.actor.applyDamage([{ value: damage, type: damageType }]);
+            damage = parts.reduce((s: number, p: any) => s + p.total, 0);
+            // Board #1887: a damage roll below 0 deals 0, dnd5e's own rule when it applies damage (per damage
+            // type); dnd5e's applyDamage would HEAL a negative number (a Str 7 kobold's Unarmed Strike rolls 1 - 2).
+            damageApplied = appliedDamage(parts);
+            await t.actor.applyDamage([{ value: damageApplied, type: damageType }]);
             hpAfter = t.actor?.system?.attributes?.hp?.value ?? hpBefore;
           }
         } catch (e: any) {
@@ -2882,6 +2911,7 @@ export class QueryHandlers {
           fumble,
           attackTotal,
           damageRolled: damage,
+          damageApplied,
           damageType,
           targetAC: AC,
           via: 'attack',
@@ -2895,6 +2925,7 @@ export class QueryHandlers {
           disadvantageReasons: _adv.reasons,
           rangeVerdict: _vr?.result ?? null,
           distanceFt: _noWallsFt,
+          ...(unarmed ? { unarmed: true } : {}),
         });
       }
       await consumeSlot();
@@ -2946,6 +2977,37 @@ export class QueryHandlers {
     }
     await consumeSlot();
     return { success: true, attacker: attTok.name, item: item.name, results };
+  }
+
+  /**
+   * Board #1887: dnd5e's own Unarmed Strike, as a temporary item owned by `actor` and never saved to it. The item is
+   * the system's compendium copy for the world's rules version (`unarmedStrikeUuid`). dnd5e prepares an owned item's
+   * final data (proficiency, to-hit, damage) only after its actor's own preparation, so the copy is given that
+   * preparation the way dnd5e's own `Item5e#clone` does for an owned clone (`prepareFinalAttributes`). Without it the
+   * roll missed the proficiency bonus (measured: `1d20 - 2` instead of `1d20 - 2 + 2`) and no damage was rolled.
+   * dnd5e's `rollAttack` itself only remembers the last attack mode on an item its actor holds, so nothing is
+   * written to the monster. Returns null when the compendium item cannot be loaded.
+   */
+  private async _unarmedStrikeFor(actor: any): Promise<any> {
+    let rules: unknown = 'modern';
+    try {
+      rules = (game as any).settings.get('dnd5e', 'rulesVersion');
+    } catch (e) {
+      rules = 'modern'; // dnd5e's own default
+    }
+    const g: any = globalThis as any;
+    let src: any = null;
+    try {
+      src = typeof g.fromUuid === 'function' ? await g.fromUuid(unarmedStrikeUuid(rules)) : null;
+    } catch (e) {
+      src = null;
+    }
+    const ItemCls: any = g.CONFIG?.Item?.documentClass;
+    if (!src || !ItemCls) return null;
+    const data = typeof src.toObject === 'function' ? src.toObject() : src;
+    const tmp: any = new ItemCls(data, { parent: actor });
+    if (typeof tmp.prepareFinalAttributes === 'function') tmp.prepareFinalAttributes();
+    return tmp;
   }
 
   // ---- Scene provisioning tools (Phase B board-prep, B5/P6 report card; Section 4f audit gap). ----

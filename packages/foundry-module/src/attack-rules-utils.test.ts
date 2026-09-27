@@ -6,6 +6,10 @@ import {
   rangeRollAdvantage,
   weaponUsedUp,
   describeRangeRefusal,
+  isUnarmedStrike,
+  unarmedStrikeUuid,
+  appliedDamage,
+  UNARMED_STRIKE_UUID,
 } from './attack-rules-utils.js';
 
 const DAGGER = ['oneHanded', 'offhand', null, 'thrown', 'thrown-offhand'];
@@ -143,5 +147,50 @@ describe('describeRangeRefusal', () => {
         normalFt: 120,
       })
     ).toEqual({ note: 'Nim is out of the range of Fire Bolt (range 120 ft)', outOfRange: true });
+  });
+});
+
+describe('Unarmed Strike (board #1887, operator "Unarmed Strike")', () => {
+  it('the name, in any case and spacing', () => {
+    expect(isUnarmedStrike('Unarmed Strike')).toBe(true);
+    expect(isUnarmedStrike('  unarmed strike ')).toBe(true);
+    expect(isUnarmedStrike('Dagger')).toBe(false);
+    expect(isUnarmedStrike(undefined)).toBe(false);
+  });
+  it("dnd5e's own item for the world's rules: 2024 by default, 2014 for legacy worlds", () => {
+    expect(unarmedStrikeUuid('modern')).toBe('Compendium.dnd5e.equipment24.Item.phbUnarmedStrike');
+    expect(unarmedStrikeUuid(undefined)).toBe(UNARMED_STRIKE_UUID.modern);
+    expect(unarmedStrikeUuid('legacy')).toBe('Compendium.dnd5e.items.Item.GsuvwoekKZatfKwF');
+  });
+});
+
+describe('appliedDamage: below 0 deals 0, per damage type (dnd5e 5.3.3 chat-card rule)', () => {
+  it("a kobold's Unarmed Strike, 1 - 2 = -1, applies 0", () => {
+    expect(appliedDamage([{ total: -1, type: 'bludgeoning' }])).toBe(0);
+  });
+  it('positive rolls are summed as before', () => {
+    expect(
+      appliedDamage([
+        { total: 4, type: 'piercing' },
+        { total: 3, type: 'fire' },
+      ])
+    ).toBe(7);
+  });
+  it('the floor is per type: a negative part of the same type is summed first', () => {
+    expect(
+      appliedDamage([
+        { total: 5, type: 'slashing' },
+        { total: -2, type: 'slashing' },
+      ])
+    ).toBe(3);
+    expect(
+      appliedDamage([
+        { total: 5, type: 'slashing' },
+        { total: -2, type: 'fire' },
+      ])
+    ).toBe(5);
+  });
+  it('nothing rolled is 0', () => {
+    expect(appliedDamage([])).toBe(0);
   });
 });
