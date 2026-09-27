@@ -128,3 +128,46 @@ describe('execute-attack tool: the exact item by id', () => {
     });
   });
 });
+
+// Board #1887 (bridge 0.10.8, engine map M07): the attack runs through Midi-QOL's own workflow, whose reactions stay off
+// unless the caller asks (Midi-QOL 14.0.12 needs DAE for them; measured on the test stack 2026-09-27).
+describe('execute-attack tool: Midi-QOL reactions', () => {
+  it('is advertised with an optional reactions switch', () => {
+    const { tools } = makeTools();
+    const def = tools.getToolDefinitions().find(d => d.name === 'execute-attack');
+    expect(def!.inputSchema.properties).toHaveProperty('reactions');
+    expect((def!.inputSchema.properties as any).reactions.type).toBe('boolean');
+    expect(def!.inputSchema.required).toEqual(['attacker', 'item', 'targets']);
+  });
+
+  it('forwards reactions: true to the bridge query', async () => {
+    const { tools, query } = makeTools();
+    await tools.handleExecuteAttack({
+      attacker: 'k1',
+      item: 'Dagger',
+      targets: ['b1'],
+      reactions: true,
+    });
+    expect(query).toHaveBeenCalledWith('foundry-mcp-bridge.executeAttack', {
+      attacker: 'k1',
+      item: 'Dagger',
+      targets: ['b1'],
+      reactions: true,
+    });
+  });
+
+  it('guard: reactions false or anything else is not forwarded (the query is exactly as before)', async () => {
+    const { tools, query } = makeTools();
+    await tools.handleExecuteAttack({
+      attacker: 'k1',
+      item: 'Dagger',
+      targets: ['b1'],
+      reactions: 'yes',
+    });
+    expect(query).toHaveBeenCalledWith('foundry-mcp-bridge.executeAttack', {
+      attacker: 'k1',
+      item: 'Dagger',
+      targets: ['b1'],
+    });
+  });
+});

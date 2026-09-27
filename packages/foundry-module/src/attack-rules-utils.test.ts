@@ -1,17 +1,20 @@
-/** Board #1887 (bridge 0.10.7): the pure range-rule helpers behind execute-attack. */
+/** Board #1887 (bridge 0.10.7, 0.10.8): the pure helpers behind execute-attack. 0.10.8 removed the helpers that did the
+ * rules by hand (rangeRollAdvantage, appliedDamage, midiIgnoresNearbyFoes); Midi-QOL's own workflow decides now. */
 
 import { describe, it, expect } from 'vitest';
 import {
   chooseAttackMode,
-  rangeRollAdvantage,
   weaponUsedUp,
   describeRangeRefusal,
   isUnarmedStrike,
   unarmedStrikeUuid,
-  appliedDamage,
   UNARMED_STRIKE_UUID,
   pickItemByName,
   usedUpCount,
+  midiAttackOptions,
+  midiCriticalDamageProblem,
+  MIDI_CRITICAL_DAMAGE_CHOICES,
+  readMidiAttack,
 } from './attack-rules-utils.js';
 
 const DAGGER = ['oneHanded', 'offhand', null, 'thrown', 'thrown-offhand'];
@@ -71,35 +74,6 @@ describe('chooseAttackMode', () => {
     expect(
       chooseAttackMode({ modes: [], thrownProperty: false, distanceFt: 30, reachFt: 5 })
     ).toEqual({ mode: undefined, thrown: false });
-  });
-});
-
-describe('rangeRollAdvantage', () => {
-  it('long range gives disadvantage', () => {
-    expect(rangeRollAdvantage({ verdict: 'dis', rangedAttack: true, foeNearby: false })).toEqual({
-      disadvantage: true,
-      reasons: ['long range'],
-    });
-  });
-  it('an enemy close by gives disadvantage to a ranged attack only', () => {
-    expect(rangeRollAdvantage({ verdict: 'normal', rangedAttack: true, foeNearby: true })).toEqual({
-      disadvantage: true,
-      reasons: ['an enemy within 5 ft can see the attacker'],
-    });
-    expect(
-      rangeRollAdvantage({ verdict: 'normal', rangedAttack: false, foeNearby: true }).disadvantage
-    ).toBe(false);
-  });
-  it('both reasons are listed; normal range and nobody close: none', () => {
-    expect(
-      rangeRollAdvantage({ verdict: 'dis', rangedAttack: true, foeNearby: true }).reasons
-    ).toHaveLength(2);
-    expect(rangeRollAdvantage({ verdict: 'normal', rangedAttack: true, foeNearby: false })).toEqual(
-      {
-        disadvantage: false,
-        reasons: [],
-      }
-    );
   });
 });
 
@@ -166,37 +140,6 @@ describe('Unarmed Strike (board #1887, operator "Unarmed Strike")', () => {
   });
 });
 
-describe('appliedDamage: below 0 deals 0, per damage type (dnd5e 5.3.3 chat-card rule)', () => {
-  it("a kobold's Unarmed Strike, 1 - 2 = -1, applies 0", () => {
-    expect(appliedDamage([{ total: -1, type: 'bludgeoning' }])).toBe(0);
-  });
-  it('positive rolls are summed as before', () => {
-    expect(
-      appliedDamage([
-        { total: 4, type: 'piercing' },
-        { total: 3, type: 'fire' },
-      ])
-    ).toBe(7);
-  });
-  it('the floor is per type: a negative part of the same type is summed first', () => {
-    expect(
-      appliedDamage([
-        { total: 5, type: 'slashing' },
-        { total: -2, type: 'slashing' },
-      ])
-    ).toBe(3);
-    expect(
-      appliedDamage([
-        { total: 5, type: 'slashing' },
-        { total: -2, type: 'fire' },
-      ])
-    ).toBe(5);
-  });
-  it('nothing rolled is 0', () => {
-    expect(appliedDamage([])).toBe(0);
-  });
-});
-
 // Board #1887, independent review of bridge 0.10.7, finding 2: which stack an attack by name means.
 describe('pickItemByName', () => {
   const stack = (id: string, quantity: number, activities = 1, type = 'weapon') => ({
@@ -244,5 +187,215 @@ describe('usedUpCount', () => {
     expect(usedUpCount('spell', 1, 0)).toBeNull();
     expect(usedUpCount('weapon', undefined, 0)).toBeNull();
     expect(usedUpCount('weapon', 1, Number.NaN)).toBeNull();
+  });
+});
+
+// ================================================================================================
+// Board #1887 (bridge 0.10.8, engine map M07): Midi-QOL's own attack workflow decides; these read it back.
+// ================================================================================================
+describe('midiAttackOptions: only automation for a GM with no hands', () => {
+  it('names the attack mode, auto-rolls and fast-forwards, never asks to confirm targets, reactions off', () => {
+    expect(midiAttackOptions({ attackMode: 'thrown' })).toEqual({
+      autoRollAttack: true,
+      fastForwardAttack: true,
+      autoRollDamage: 'onHit',
+      fastForwardDamage: true,
+      workflowOptions: {
+        targetConfirmation: 'none',
+        attackMode: 'thrown',
+        noProvokeReaction: true,
+      },
+    });
+  });
+  it('reactions on: Midi-QOL is left to offer them', () => {
+    expect(midiAttackOptions({ attackMode: 'oneHanded', reactions: true }).workflowOptions).toEqual(
+      { targetConfirmation: 'none', attackMode: 'oneHanded' }
+    );
+  });
+  it('no mode (a spell attack): none is named', () => {
+    expect(midiAttackOptions({ attackMode: undefined }).workflowOptions).toEqual({
+      targetConfirmation: 'none',
+      noProvokeReaction: true,
+    });
+  });
+  it("never sets advantage, disadvantage or a critical (those are the engine's)", () => {
+    const o: any = midiAttackOptions({ attackMode: 'thrown' });
+    for (const k of ['advantage', 'disadvantage', 'isCritical', 'critical'])
+      expect(o[k] ?? o.workflowOptions[k]).toBeUndefined();
+  });
+});
+
+describe("midiCriticalDamageProblem: Midi-QOL's GM critical damage setting", () => {
+  it("'none' (Midi's own default for the GM, which it does not handle) is reported", () => {
+    expect(midiCriticalDamageProblem('none')).toMatch(/is 'none'.*adds no critical dice/);
+  });
+  it('a missing value is reported too', () => {
+    expect(midiCriticalDamageProblem(undefined)).toMatch(/is 'undefined'/);
+  });
+  it("every one of Midi-QOL 14.0.12's own choices is fine", () => {
+    expect(MIDI_CRITICAL_DAMAGE_CHOICES).toContain('default');
+    for (const c of MIDI_CRITICAL_DAMAGE_CHOICES) expect(midiCriticalDamageProblem(c)).toBeNull();
+  });
+});
+
+// A workflow shaped the way Midi-QOL 14.0.12 left it on the test stack (2026-09-27): a 45 ft Dagger throw that hit.
+const TARGET = { uuid: 'Scene.s1.Token.hero', id: 'hero' };
+function wf(extra: any = {}) {
+  const heroTok = { id: 'hero', document: { uuid: 'Scene.s1.Token.hero' } };
+  return {
+    currentAction: { name: 'bound WorkflowState_Cleanup' },
+    aborted: false,
+    attackRoll: {
+      formula: '2d20dis + 2 + 2',
+      total: 12,
+      options: { advantageMode: -1, attackMode: 'thrown' },
+    },
+    attackTotal: 12,
+    isCritical: false,
+    isFumble: false,
+    hitTargets: new Set([heroTok]),
+    hitTargetsEC: new Set(),
+    attackRollModifierTracker: {
+      attribution: { DIS: { range: 'Long Range' }, NOCRIT: { direct: 'Direct assignment' } },
+    },
+    hitDisplayData: {
+      'Scene.s1.Token.hero': { ac: 11, baseAc: 11, acTooltip: '11', attackTotal: 12 },
+    },
+    damageRolls: [{ formula: '1d4 + 2', total: 3, options: { type: 'piercing' } }],
+    damageList: [
+      {
+        targetUuid: 'Scene.s1.Token.hero',
+        oldHP: 17,
+        newHP: 14,
+        hpDamage: 3,
+        tempDamage: 0,
+        totalDamage: 3,
+        damageDetail: [{ type: 'piercing', value: 3 }],
+      },
+    ],
+    ...extra,
+  };
+}
+
+describe("readMidiAttack: what Midi-QOL's workflow decided", () => {
+  it('the measured 45 ft throw: hit, at disadvantage for Long Range, 3 piercing applied', () => {
+    const r = readMidiAttack(wf(), TARGET);
+    expect(r).toMatchObject({
+      ran: true,
+      state: 'WorkflowState_Cleanup',
+      hit: true,
+      crit: false,
+      attackTotal: 12,
+      formula: '2d20dis + 2 + 2',
+      attackMode: 'thrown',
+      targetAC: 11,
+      disadvantage: true,
+      advantage: false,
+      rollMode: 'disadvantage',
+      disadvantageReasons: ['Long Range'],
+      advantageReasons: [],
+      damageRolled: 3,
+      damageApplied: 3,
+      damageType: 'piercing',
+      engineHpAfter: 14,
+      error: null,
+    });
+    expect(r.rollModifiers).toEqual({ DIS: ['Long Range'], NOCRIT: ['Direct assignment'] });
+  });
+
+  it('a miss: no damage is counted even if a damage list exists', () => {
+    const r = readMidiAttack(wf({ hitTargets: new Set() }), TARGET);
+    expect(r.hit).toBe(false);
+    expect(r.damageApplied).toBe(0);
+    expect(r.engineHpAfter).toBeNull();
+  });
+
+  it('advantage and disadvantage that cancel: a normal roll, both sources kept in rollModifiers', () => {
+    const r = readMidiAttack(
+      wf({
+        attackRoll: { formula: '1d20 + 4', total: 14, options: { advantageMode: 0 } },
+        attackRollModifierTracker: {
+          attribution: { ADV: { 'attack.all': 'Pack Tactics' }, DIS: { range: 'Long Range' } },
+        },
+      }),
+      TARGET
+    );
+    expect(r.rollMode).toBe('normal');
+    expect(r.advantageReasons).toEqual([]);
+    expect(r.disadvantageReasons).toEqual([]);
+    expect(r.rollModifiers).toEqual({ ADV: ['Pack Tactics'], DIS: ['Long Range'] });
+  });
+
+  it("Midi's damage floor: a -1 roll (a Str 7 Unarmed Strike) is rolled -1 and applied 0", () => {
+    const r = readMidiAttack(
+      wf({
+        damageRolls: [{ formula: '1 - 2', total: -1, options: { type: 'bludgeoning' } }],
+        damageList: [
+          {
+            targetUuid: 'Scene.s1.Token.hero',
+            newHP: 14,
+            hpDamage: 0,
+            tempDamage: 0,
+            totalDamage: 0,
+          },
+        ],
+      }),
+      TARGET
+    );
+    expect(r.damageRolled).toBe(-1);
+    expect(r.damageApplied).toBe(0);
+  });
+
+  it('resistance: the applied damage is the damage list total after it, the roll before it', () => {
+    const r = readMidiAttack(
+      wf({
+        damageRolls: [{ formula: '1d4 + 2', total: 6, options: { type: 'piercing' } }],
+        damageList: [
+          {
+            targetUuid: 'Scene.s1.Token.hero',
+            newHP: 14,
+            hpDamage: 3,
+            totalDamage: 3,
+            damageDetail: [{ type: 'piercing', value: 3 }],
+          },
+        ],
+      }),
+      TARGET
+    );
+    expect(r.damageRolled).toBe(6);
+    expect(r.damageApplied).toBe(3);
+    expect(r.damageDetail).toEqual([{ type: 'piercing', value: 3 }]);
+  });
+
+  it('total cover: no AC number, and it says so', () => {
+    const r = readMidiAttack(
+      wf({
+        hitTargets: new Set(),
+        hitDisplayData: { 'Scene.s1.Token.hero': { ac: Infinity, acDisplay: '∞', baseAc: 11 } },
+      }),
+      TARGET
+    );
+    expect(r.totalCover).toBe(true);
+    expect(r.targetAC).toBeNull();
+    expect(r.targetBaseAC).toBe(11);
+  });
+
+  it('nothing back, aborted, or no attack roll: not run, and the error says which', () => {
+    expect(readMidiAttack(undefined, TARGET)).toMatchObject({ ran: false, hit: false });
+    expect(readMidiAttack(undefined, TARGET).error).toMatch(/gave nothing back/);
+    expect(readMidiAttack(wf({ aborted: true }), TARGET).error).toMatch(
+      /aborted at WorkflowState_Cleanup/
+    );
+    expect(
+      readMidiAttack(
+        wf({ attackRoll: null, currentAction: { name: 'WorkflowState_RollFinished' } }),
+        TARGET
+      ).error
+    ).toMatch(/no attack roll \(at WorkflowState_RollFinished\)/);
+  });
+
+  it('the hit is matched by token id when the uuid differs (an unlinked token)', () => {
+    const r = readMidiAttack(wf(), { uuid: 'Scene.s1.Token.other', id: 'hero' });
+    expect(r.hit).toBe(true);
   });
 });

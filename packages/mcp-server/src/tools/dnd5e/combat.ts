@@ -78,7 +78,7 @@ export class CombatTools {
       {
         name: 'execute-attack',
         description:
-          "Resolve an attack. The Foundry engine (Midi-QOL) rolls the attack vs the target's AC, rolls damage on a hit, and applies it automatically. Provide the attacker token (name or id), the weapon/attack item name on that attacker, and the target token(s) (name or id). Returns the damage applied and each target's HP before/after.",
+          "Resolve an attack. The Foundry engine (Midi-QOL's own attack workflow) rolls the attack vs the target's AC, decides hit, critical, advantage and disadvantage, rolls damage on a hit, and applies it with the target's resistances. Provide the attacker token (name or id), the weapon/attack item name on that attacker, and the target token(s) (name or id). Returns what the engine decided and each target's HP before/after.",
         inputSchema: {
           type: 'object',
           properties: {
@@ -99,6 +99,11 @@ export class CombatTools {
               type: 'array',
               items: { type: 'string' },
               description: 'Target token name(s) or id(s).',
+            },
+            reactions: {
+              type: 'boolean',
+              description:
+                "Optional: let Midi-QOL offer the target's reactions (Shield, Parry). Off by default: Midi-QOL 14.0.12 needs the DAE add-on for them, and a reaction prompt waits for someone to answer.",
             },
           },
           required: ['attacker', 'item', 'targets'],
@@ -131,6 +136,7 @@ export class CombatTools {
         item: args?.item,
         targets: args?.targets || [],
         ...(args?.itemId ? { itemId: args.itemId } : {}),
+        ...(args?.reactions === true ? { reactions: true } : {}),
       })
     );
   }

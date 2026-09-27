@@ -1,25 +1,34 @@
 /**
- * Board #1887 (plan F.4(b), bridge 0.10.7, dnd-dm KNOWN-ISSUES row 221): handler-level tests for
- * execute-attack's range rules.
+ * Board #1887 (plan F.4(b) bridge 0.10.7; engine map M07 bridge 0.10.8): handler-level tests for execute-attack.
  *
- * These run the REAL QueryHandlers#handleExecuteAttack from queries.ts against a small in-memory
- * Foundry stand-in:
- * - The attack activity's `rollAttack` follows dnd5e 5.3.3's own `AttackActivity#rollAttack`
- *   (dnd5e.mjs lines 28450-28580 of the system the test stack runs), reduced to the parts that
- *   decide the result here: the remembered attack mode (`flags.dnd5e.last.<activity>.attackMode`)
- *   used when none is given, the mode checked against the item's `attackModes` (falling back to the
- *   first), `D20Roll.applyKeybindings` turning `advantage`/`disadvantage` into the roll's mode
- *   (lines 78836-78857), a THROWN mode using the weapon up (quantity - 1, never below 0, not for a
- *   Returning weapon), and a quantity of 0 giving only a warning. The roll formulas are the ones the
- *   test stack printed on 2026-09-27 ("1d20 + 2 + 2", "2d20dis + 2 + 2").
- * - MidiQOL's `checkActivityRange` follows Midi-QOL 14.0.12's own rules (utils.ts
- *   checkRangeFunction): a wall under `wallsBlockRange` (negative distance) fails, beyond long range
- *   fails (`checkRange: longFail`, the live and test setting), beyond normal range is `dis`.
- *   `getDistance` / `computeDistance` / `checkNearby` / `canSee` answer from the positions below.
+ * These run the REAL QueryHandlers#handleExecuteAttack from queries.ts against a small in-memory Foundry stand-in:
+ * - The attack activity's `rollAttack` follows dnd5e 5.3.3's own `AttackActivity#rollAttack` (dnd5e attack.mjs),
+ *   reduced to the parts that decide the result here: the remembered attack mode
+ *   (`flags.dnd5e.last.<activity>.attackMode`) used when none is given, the mode checked against the item's
+ *   `attackModes` (falling back to the first), `advantage`/`disadvantage` turned into the roll's mode, a THROWN mode
+ *   using the weapon up (quantity - 1, never below 0, not for a Returning weapon), and a quantity of 0 giving only a
+ *   warning. The roll formulas are the ones the test stack printed on 2026-09-27 ("1d20 + 2 + 2", "2d20dis + 2 + 2").
+ * - MidiQOL's `checkActivityRange` follows Midi-QOL 14.0.12's own rules (utils.ts checkRangeFunction): a wall under
+ *   `wallsBlockRange` (negative distance) fails, beyond long range fails (`checkRange: longFail`, the live and test
+ *   setting), beyond normal range is `dis`. `getDistance` / `computeDistance` / `canSee` answer from the positions.
+ * - Bridge 0.10.8: MidiQOL's `completeActivityUse` is a reduced Midi-QOL 14.0.12 attack workflow (Workflow.ts,
+ *   AttackActivity.ts, utils.ts), the parts measured on the test stack on 2026-09-27:
+ *   - a weapon with the Thrown property and NO `workflowOptions.attackMode`, or a GM roll not fast-forwarded, opens a
+ *     roll dialog and the workflow waits for ever (AttackRollConfigurationDialog; the stuck state WaitForAttackRoll);
+ *   - its own range check (ValidateRoll: `fail` ends the workflow, `dis` = disadvantage "Long Range");
+ *   - advantage and disadvantage from its tracker: Midi flags on the attacker (`flags.midi-qol.advantage.attack.all`,
+ *     a condition), its optional nearby-foe rule only when `optionalRulesEnabled` (checkRule), `ignoreNearbyFoes`;
+ *   - its hit test (total + bonuses >= the AC it computes, cover included; a natural 20 hits, a natural 1 misses);
+ *   - reactions: a target with a usable reaction, on a hit, with reactions not switched off (`noProvokeReaction`),
+ *     crashes the workflow the way 14.0.12 does without DAE (doReactions reads `globalThis.DAE.actionQueue`);
+ *   - critical damage per its GM setting (`criticalDamageGM`: one of its choices adds dnd5e's critical dice, 'none'
+ *     adds none, measured: '1d4 + 2' on a natural 20);
+ *   - damage: dnd5e's resistance halves (calculateDamage), the total never below 0 (setupDamageDetails), applied by
+ *     Midi itself (its damage card, `autoApplyDamage: yes`), and dnd5e's `activity.use` spending a spell slot.
  *
- * What this proves: which mode and advantage the handler asks dnd5e for, what it refuses, and the
- * words it uses. What it does NOT prove: that the live dnd5e and Midi-QOL answer the same way. That
- * is FS-07 on the test stack (dnd-dm-modtest/README.md).
+ * What this proves: what execute-attack asks the engine for, that it takes the engine's answers (and never works a
+ * rule out itself), what it refuses, and the words it uses. What it does NOT prove: that the live dnd5e and Midi-QOL
+ * answer the same way. That is the test-stack run (dnd-dm-modtest/README.md).
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -54,6 +63,11 @@ let rollCalls: any[] = [];
 let damageCalls: any[] = [];
 let warnings: string[] = [];
 let d20Queue: number[] = [];
+let midiCalls: any[] = [];
+let applyDamageCalls: any[] = [];
+let openApps: Map<string, any>;
+let liveWorkflows: Map<string, any>;
+let midiConfig: any;
 
 function getProperty(obj: any, path: string) {
   return path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
@@ -86,6 +100,8 @@ function makeWeapon(opts: {
   type?: string;
   remembered?: string;
   id?: string;
+  level?: number;
+  midiProperties?: any;
 }) {
   const item: any = {
     id: opts.id ?? `item${opts.name.replace(/\W/g, '')}`,
@@ -100,7 +116,7 @@ function makeWeapon(opts: {
       range: { units: 'ft', ...opts.range },
       properties: new Set(opts.properties),
       attackModes: opts.attackModes,
-      level: 0,
+      level: opts.level ?? 0,
     },
     getFlag(scope: string, key: string) {
       return getProperty(this.flags, `${scope}.${key}`);
@@ -111,10 +127,12 @@ function makeWeapon(opts: {
   };
   const activity: any = {
     id: `act${opts.name.replace(/\W/g, '')}`,
+    uuid: `Item.${item.id}.Activity.act${opts.name.replace(/\W/g, '')}`,
     type: 'attack',
     actionType: opts.actionType ?? 'mwak',
     attack: {},
     item,
+    midiProperties: opts.midiProperties ?? {},
     // dnd5e 5.3.3 AttackActivity#rollAttack, reduced (see the file header).
     async rollAttack(config: any = {}, dialog: any = {}, _message: any = {}) {
       if (this.item.type === 'weapon' && this.item.system.quantity === 0) {
@@ -125,10 +143,12 @@ function makeWeapon(opts: {
         ...config,
       };
       const attackModeOptions = this.item.system.attackModes;
-      if (!attackModeOptions?.find((m: any) => m.value === rollConfig.attackMode)) {
-        rollConfig.attackMode = attackModeOptions?.[0]?.value;
+      if (
+        attackModeOptions?.length &&
+        !attackModeOptions.find((m: any) => m.value === rollConfig.attackMode)
+      ) {
+        rollConfig.attackMode = attackModeOptions[0]?.value;
       }
-      // D20Roll.applyKeybindings with no key pressed.
       const advantage = !!rollConfig.advantage;
       const disadvantage = !!rollConfig.disadvantage;
       const advantageMode = advantage && !disadvantage ? 1 : !advantage && disadvantage ? -1 : 0;
@@ -160,9 +180,18 @@ function makeWeapon(opts: {
       });
       return [roll];
     },
+    // dnd5e's damage roll, reduced: 1d4 + 2 = 4; a critical with dnd5e's own critical dice adds one more d4 (2).
     async rollDamage(config: any = {}) {
       damageCalls.push({ ...config });
-      return [{ total: 4, options: { type: 'piercing' }, terms: [] }];
+      const extra = config.isCritical && config.criticalDice ? 2 : 0;
+      return [
+        {
+          formula: extra ? '2d4 + 2' : '1d4 + 2',
+          total: 4 + extra,
+          options: { type: 'piercing' },
+          terms: [],
+        },
+      ];
     },
   };
   item.system.activities = new ValueCollection([activity]);
@@ -173,7 +202,7 @@ function makeWeapon(opts: {
 
 function makeDagger(
   quantity = 1,
-  extra: Partial<{ properties: string[]; remembered: string }> = {}
+  extra: Partial<{ properties: string[]; remembered: string; midiProperties: any }> = {}
 ) {
   return makeWeapon({
     name: 'Dagger',
@@ -182,21 +211,38 @@ function makeDagger(
     properties: extra.properties ?? ['fin', 'lgt', 'thr'],
     attackModes: DAGGER_MODES,
     ...(extra.remembered ? { remembered: extra.remembered } : {}),
+    ...(extra.midiProperties ? { midiProperties: extra.midiProperties } : {}),
   });
 }
 
-function makeActor(name: string, items: any[], hp = 20, ac = 12, flags: any = {}) {
+function makeActor(
+  name: string,
+  items: any[],
+  hp = 20,
+  ac = 12,
+  flags: any = {},
+  extra: Partial<{ resist: string[]; reactions: string[] }> = {}
+) {
   const actor: any = {
     name,
     items: new ValueCollection(items),
     flags,
     effects: [],
-    system: { attributes: { ac: { value: ac }, hp: { value: hp, max: hp } }, spells: {} },
+    reactions: extra.reactions ?? [],
+    system: {
+      attributes: { ac: { value: ac }, hp: { value: hp, max: hp, temp: 0 } },
+      spells: {},
+      traits: { dr: { value: new Set(extra.resist ?? []) } },
+    },
     async applyDamage(parts: any[]) {
+      applyDamageCalls.push(parts);
       for (const p of parts) actor.system.attributes.hp.value -= p.value;
     },
-    async update() {},
+    async update(changes: any = {}) {
+      for (const [k, v] of Object.entries(changes)) setProperty(actor, k, v);
+    },
   };
+  for (const it of items) it.parent = actor;
   return actor;
 }
 
@@ -209,16 +255,14 @@ interface Tok {
   disposition: number;
   actor: any;
   seesAttacker?: boolean;
+  cover?: number;
 }
 
 let tokens: ValueCollection<any>;
 let walls: Set<string>; // "idA|idB" pairs a wall stands between (either order)
 let wallsOnFt: Map<string, number>; // a walls-on distance that differs from the open measure
 let midiRules: any;
-// Board #1887 review finding 5: which Midi-QOL calls the stand-in makes throw, and whether its condition evaluator
-// is missing.
 let midiThrows: Record<string, boolean> = {};
-let midiNoEvaluator = false;
 
 function key(a: any, b: any) {
   return [a.id, b.id].sort().join('|');
@@ -228,16 +272,27 @@ function openFeet(a: any, b: any) {
   return (Math.max(Math.abs(a.x - b.x), Math.abs(a.y - b.y)) / GRID) * FT;
 }
 
+const MIDI_CRIT_CHOICES = [
+  'default',
+  'maxDamage',
+  'maxCrit',
+  'doubleDice',
+  'explode',
+  'baseDamage',
+];
+
 function install(toks: Tok[]) {
   const docs = toks.map(t => {
     const doc: any = {
       id: t.id,
+      uuid: `Scene.scene1.Token.${t.id}`,
       name: t.name,
       x: t.sq * GRID,
       y: (t.sy ?? 0) * GRID,
       disposition: t.disposition,
       actor: t.actor,
       seesAttacker: t.seesAttacker ?? true,
+      cover: t.cover ?? 0,
       async update(ch: any) {
         Object.assign(doc, ch);
       },
@@ -245,6 +300,10 @@ function install(toks: Tok[]) {
     doc.object = {
       id: t.id,
       document: doc,
+      name: t.name,
+      get actor() {
+        return doc.actor;
+      },
       get center() {
         return { x: doc.x + GRID / 2, y: doc.y + GRID / 2 };
       },
@@ -263,13 +322,21 @@ function install(toks: Tok[]) {
       get(scope: string, name: string) {
         if (scope === 'midi-qol' && name === 'ConfigSettings') {
           if (midiThrows.settings) throw new Error('settings exploded');
-          return { optionalRules: midiRules };
+          return { ...midiConfig, optionalRules: midiRules };
         }
         throw new Error(`unknown setting ${scope}.${name}`);
       },
     },
   };
   g.canvas = { dimensions: { distance: FT } };
+  g.ui = {
+    notifications: {
+      warn: (m: string) => warnings.push(`ui:${m}`),
+      error: (m: string) => warnings.push(`ui:${m}`),
+      info: () => {},
+    },
+  };
+  g.foundry = { applications: { instances: openApps } };
   const docOf = (o: any) => o?.document || o;
   const distance = (a: any, b: any, opts: any = {}) => {
     const A = docOf(a),
@@ -281,7 +348,79 @@ function install(toks: Tok[]) {
   const maybeThrow = (what: string) => {
     if (midiThrows[what]) throw new Error(`${what} exploded`);
   };
+  // Midi-QOL 14.0.12 checkRangeFunction, reduced (checkRange 'longFail').
+  const rangeVerdict = (activity: any, tokenObj: any, targets: Iterable<any>) => {
+    const rng = activity.item.system.range || {};
+    let range = Number(rng.value) || Number(rng.reach) || 0;
+    let longRange = Number(rng.long) || 0;
+    const thr = activity.item.system.properties?.has('thr');
+    if (['mwak', 'msak'].includes(activity.actionType) && !thr) {
+      longRange = 0;
+      range = Number(rng.reach) || 5;
+    }
+    if (longRange > 0 && longRange < range) longRange = range;
+    for (const t of targets) {
+      const raw = distance(tokenObj, t, {
+        wallsBlock: midiRules.wallsBlockRange !== 'none',
+        includeCover: true,
+      });
+      if (raw < 0) return { result: 'fail', attackingToken: tokenObj, range, longRange };
+      const d = Math.max(0, Math.round(raw));
+      if ((longRange !== 0 && d > longRange) || (d > range && longRange === 0)) {
+        return { result: 'fail', attackingToken: tokenObj, range, longRange };
+      }
+      if (d > range) return { result: 'dis', attackingToken: tokenObj, range, longRange };
+    }
+    return { result: 'normal', attackingToken: tokenObj, range, longRange };
+  };
+  // Midi-QOL findNearby/checkNearby, reduced: a token of the opposite disposition within `dist` feet that sees it.
+  const nearbyFoe = (tokenObj: any, dist: number) => {
+    const me = docOf(tokenObj);
+    const want = me.disposition * -1;
+    return tokens.contents.some(
+      (t: any) =>
+        t.id !== me.id &&
+        t.disposition === want &&
+        (t.actor?.system?.attributes?.hp?.value ?? 1) > 0 &&
+        distance(t, me, { wallsBlock: true }) >= 0 &&
+        distance(t, me, { wallsBlock: true }) <= dist &&
+        t.seesAttacker
+    );
+  };
+  const evalFlag = (actor: any, flag: string) => {
+    const v = getProperty(actor, flag);
+    if (v === undefined || v === null || v === '') return false;
+    if (typeof v === 'boolean') return v;
+    return !!new Function(`return (${String(v)});`)();
+  };
+  const stuck = (id: string, state: string, dialog?: string) => {
+    const w: any = {
+      id,
+      activity: null,
+      currentAction: { name: state },
+      aborted: false,
+      async performState(s: any) {
+        w.currentAction = s;
+        w.abortedByBridge = true;
+      },
+      WorkflowState_Abort: { name: 'WorkflowState_Abort' },
+    };
+    liveWorkflows.set(id, w);
+    if (dialog) {
+      const app: any = {
+        constructor: { name: dialog },
+        closed: false,
+        async close() {
+          app.closed = true;
+          openApps.delete(dialog);
+        },
+      };
+      openApps.set(dialog, app);
+    }
+    return w;
+  };
   g.MidiQOL = {
+    Workflow: { workflows: liveWorkflows },
     getDistance: (a: any, b: any, opts: any = {}) => {
       maybeThrow(opts.wallsBlock ? 'distanceWallsOn' : 'distanceWallsOff');
       return distance(a, b, opts);
@@ -291,61 +430,157 @@ function install(toks: Tok[]) {
       maybeThrow('canSee');
       return true;
     },
-    // Midi-QOL 14.0.12 evalAllConditions / createConditionData, reduced: the actor's own flag is a condition
-    // expression, evaluated (here with plain JavaScript) to a truthy or falsy answer.
-    ...(midiNoEvaluator
-      ? {}
-      : {
-          createConditionData: (d: any) => ({ actorName: d?.actor?.name, target: d?.target }),
-          evalAllConditions: (actor: any, flag: string) => {
-            maybeThrow('evalAllConditions');
-            const v = getProperty(actor, flag);
-            if (v === undefined || v === null || v === '') return false;
-            if (typeof v === 'boolean') return v;
-            return !!new Function(`return (${String(v)});`)();
-          },
-        }),
-    // Midi-QOL 14.0.12 checkRangeFunction, reduced (checkRange 'longFail').
     checkActivityRange(activity: any, tokenObj: any, targets: Set<any>) {
       maybeThrow('checkActivityRange');
-      const rng = activity.item.system.range || {};
-      let range = Number(rng.value) || Number(rng.reach) || 0;
-      let longRange = Number(rng.long) || 0;
-      const thr = activity.item.system.properties?.has('thr');
-      if (['mwak', 'msak'].includes(activity.actionType) && !thr) {
-        longRange = 0;
-        range = Number(rng.reach) || 5;
-      }
-      if (longRange > 0 && longRange < range) longRange = range;
-      for (const t of targets) {
-        const raw = distance(tokenObj, t, {
-          wallsBlock: midiRules.wallsBlockRange !== 'none',
-          includeCover: true,
-        });
-        if (raw < 0) return { result: 'fail', attackingToken: tokenObj, range, longRange };
-        const d = Math.max(0, Math.round(raw));
-        if ((longRange !== 0 && d > longRange) || (d > range && longRange === 0)) {
-          return { result: 'fail', attackingToken: tokenObj, range, longRange };
-        }
-        if (d > range) return { result: 'dis', attackingToken: tokenObj, range, longRange };
-      }
-      return { result: 'normal', attackingToken: tokenObj, range, longRange };
+      return rangeVerdict(activity, tokenObj, targets);
     },
-    // Midi-QOL findNearby/checkNearby, reduced: a token of the opposite disposition within
-    // `dist` feet (walls on) that can see the attacker.
-    checkNearby(disposition: number, tokenObj: any, dist: number, opts: any = {}) {
-      maybeThrow('checkNearby');
-      const me = docOf(tokenObj);
-      const want = me.disposition * disposition;
-      return tokens.contents.some(
-        (t: any) =>
-          t.id !== me.id &&
-          t.disposition === want &&
-          (t.actor?.system?.attributes?.hp?.value ?? 1) > 0 &&
-          distance(t, me, { wallsBlock: true }) >= 0 &&
-          distance(t, me, { wallsBlock: true }) <= dist &&
-          (!opts.canSee || t.seesAttacker)
+    // Midi-QOL's public checkNearby (the bridge no longer calls it: Midi's own workflow does, when its rule is on).
+    checkNearby(_disposition: number, tokenObj: any, dist: number) {
+      return nearbyFoe(tokenObj, dist);
+    },
+    // Midi-QOL 14.0.12's attack workflow, reduced (see the file header).
+    async completeActivityUse(activity: any, usage: any, dialog: any, _message: any) {
+      const mo = usage?.midiOptions ?? {};
+      const wo = { ...mo, ...(mo.workflowOptions ?? {}) };
+      midiCalls.push({ activity, usage, dialog });
+      const item = activity.item;
+      const actor = item.parent;
+      const attDoc = tokens.contents.find((t: any) => t.actor === actor);
+      const targets = [...(mo.targetsToUse ?? [])];
+      const tgt = targets[0];
+      const tDoc = docOf(tgt);
+      const wfId = `wf${midiCalls.length}`;
+      // A roll dialog in a browser nobody sits at: the workflow waits for ever.
+      const dialogForced =
+        activity.midiProperties?.forceRollDialog === 'always' ||
+        !wo.fastForwardAttack ||
+        (item.system.properties?.has('thr') && !wo.attackMode);
+      if (dialogForced) {
+        const w = stuck(wfId, 'WorkflowState_WaitForAttackRoll', 'AttackRollConfigurationDialog');
+        w.activity = activity;
+        return new Promise(() => {});
+      }
+      if (midiThrows.completeActivityUse) throw new Error('the roll dialog was closed');
+      // dnd5e activity.use: a levelled spell spends a slot.
+      if (item.type === 'spell' && (item.system.level || 0) > 0) {
+        const k = `system.spells.spell${item.system.level}.value`;
+        setProperty(actor, k, Math.max(0, (getProperty(actor, k) ?? 0) - 1));
+      }
+      // A save activity: Midi rolls the target's save (not modelled here) and ends.
+      if (activity.type === 'save')
+        return {
+          currentAction: { name: 'WorkflowState_Cleanup' },
+          aborted: false,
+          attackRoll: null,
+        };
+      // ValidateRoll: Midi's own range check.
+      const rv = rangeVerdict(activity, attDoc.object, [tgt]);
+      if (rv.result === 'fail')
+        return {
+          currentAction: { name: 'WorkflowState_RollFinished' },
+          attackRoll: null,
+          aborted: false,
+        };
+      const attribution: any = {};
+      const add = (kind: string, src: string, name: string) => {
+        attribution[kind] ??= {};
+        attribution[kind][src] = name;
+      };
+      if (rv.result === 'dis') add('DIS', 'range', 'Long Range');
+      if (evalFlag(actor, 'flags.midi-qol.advantage.attack.all'))
+        add('ADV', 'attack.all', 'Pack Tactics - Advantage Attack (All)');
+      const optional = !!midiConfig.optionalRulesEnabled;
+      const ranged =
+        ['rwak', 'rsak'].includes(activity.actionType) ||
+        (item.system.properties?.has('thr') &&
+          distance(attDoc, tDoc) > (Number(item.system.range?.reach) || 5));
+      if (
+        optional &&
+        midiRules.nearbyFoe &&
+        ranged &&
+        !evalFlag(actor, 'flags.midi-qol.ignoreNearbyFoes') &&
+        nearbyFoe(attDoc.object, midiRules.nearbyFoe)
+      )
+        add('DIS', 'nearbyFoe', 'Nearby foe');
+      const adv = !!attribution.ADV;
+      const dis = !!attribution.DIS;
+      const rolls = await activity.rollAttack(
+        {
+          // Midi's AttackActivity.rollAttack: config.attackMode ??= this.attackMode ?? 'oneHanded'
+          attackMode: wo.attackMode ?? 'oneHanded',
+          ...(adv ? { advantage: true } : {}),
+          ...(dis ? { disadvantage: true } : {}),
+        },
+        { configure: false },
+        {}
       );
+      const roll = rolls[0];
+      const crit = !!roll.isCritical;
+      const fumble = !!roll.isFumble;
+      const baseAc = tDoc.actor.system.attributes.ac.value;
+      const ac = baseAc + (tDoc.cover === Infinity ? Infinity : tDoc.cover || 0);
+      let hit = Number.isFinite(ac) && (crit || (!fumble && roll.total >= ac));
+      // checkHits, reactions: without DAE, a reaction prompt crashes the workflow (doReactions).
+      if (hit && tDoc.actor.reactions?.length && !wo.noProvokeReaction) {
+        const w = stuck(wfId, 'WorkflowState_AttackRollComplete');
+        w.activity = activity;
+        return new Promise(() => {});
+      }
+      const wf: any = {
+        currentAction: { name: 'WorkflowState_Cleanup' },
+        aborted: false,
+        attackRoll: roll,
+        attackTotal: roll.total,
+        isCritical: crit,
+        isFumble: fumble,
+        hitTargets: new Set(hit ? [tgt] : []),
+        hitTargetsEC: new Set(),
+        attackRollModifierTracker: { attribution },
+        hitDisplayData: {
+          [tDoc.uuid]: {
+            ac,
+            acDisplay: Number.isFinite(ac) ? String(ac) : '∞',
+            baseAc,
+            attackTotal: roll.total,
+          },
+        },
+        damageRolls: [],
+        damageList: [],
+      };
+      if (hit) {
+        const dr = await activity.rollDamage({
+          isCritical: crit,
+          criticalDice: MIDI_CRIT_CHOICES.includes(midiConfig.criticalDamageGM),
+          attackMode: wo.attackMode,
+        });
+        wf.damageRolls = dr ?? [];
+        const byType = new Map<string, number>();
+        for (const r of wf.damageRolls)
+          byType.set(r.options?.type, (byType.get(r.options?.type) ?? 0) + r.total);
+        let total = 0;
+        const detail: any[] = [];
+        for (const [type, v] of byType) {
+          const val = tDoc.actor.system.traits?.dr?.value?.has(type) ? Math.floor(v / 2) : v;
+          detail.push({ type, value: val });
+          total += val;
+        }
+        total = Math.max(0, total);
+        const hp = tDoc.actor.system.attributes.hp;
+        const hpDamage = Math.min(total, hp.value);
+        wf.damageList = [
+          {
+            targetUuid: tDoc.uuid,
+            oldHP: hp.value,
+            newHP: hp.value - hpDamage,
+            hpDamage,
+            tempDamage: 0,
+            totalDamage: total,
+            damageDetail: detail,
+          },
+        ];
+        if (midiConfig.autoApplyDamage === 'yes') hp.value -= hpDamage;
+      }
+      return wf;
     },
   };
 }
@@ -356,6 +591,8 @@ function world(opts: {
   extraTokens?: Tok[];
   attackerItems?: any[];
   attackerFlags?: any;
+  target?: any;
+  targetCover?: number;
 }) {
   const dagger = opts.dagger ?? makeDagger(1);
   const kobold = makeActor(
@@ -365,22 +602,31 @@ function world(opts: {
     14,
     opts.attackerFlags
   );
-  const brakka = makeActor('Brakka', [], 20, 16);
+  const brakka = opts.target ?? makeActor('Brakka', [], 20, 16);
   install([
     { id: 'kobold', name: 'Kobold Warrior', sq: 0, disposition: -1, actor: kobold },
-    { id: 'brakka', name: 'Brakka', sq: opts.targetFeet / FT, disposition: 1, actor: brakka },
+    {
+      id: 'brakka',
+      name: 'Brakka',
+      sq: opts.targetFeet / FT,
+      disposition: 1,
+      actor: brakka,
+      ...(opts.targetCover !== undefined ? { cover: opts.targetCover } : {}),
+    },
     ...(opts.extraTokens ?? []),
   ]);
   return { dagger, kobold, brakka };
 }
 
-async function attack(item = 'Dagger', targets = ['brakka'], itemId?: string) {
+async function attack(item = 'Dagger', targets = ['brakka'], itemId?: string, more: any = {}) {
   const h = new QueryHandlers() as any;
+  h.midiAttackTimeoutMs = 60;
   return h.handleExecuteAttack({
     attacker: 'kobold',
     item,
     targets,
     ...(itemId ? { itemId } : {}),
+    ...more,
   });
 }
 
@@ -389,11 +635,281 @@ beforeEach(() => {
   damageCalls = [];
   warnings = [];
   d20Queue = [];
+  midiCalls = [];
+  applyDamageCalls = [];
+  openApps = new Map();
+  liveWorkflows = new Map();
   walls = new Set();
   wallsOnFt = new Map();
   midiRules = { wallsBlockRange: 'center', nearbyFoe: 5, checkRange: 'longFail' };
+  // The test world's own Midi-QOL settings (read 2026-09-27): optional rules off, GM critical damage 'default' here
+  // (the world holds 'none'; that case has its own tests), damage applied automatically.
+  midiConfig = { optionalRulesEnabled: false, criticalDamageGM: 'default', autoApplyDamage: 'yes' };
   midiThrows = {};
-  midiNoEvaluator = false;
+});
+
+describe("bridge 0.10.8: the attack is Midi-QOL's own workflow (engine map M07)", () => {
+  it('asks Midi-QOL once per target, naming the attack mode, with no dialog and reactions off', async () => {
+    world({ targetFeet: 5 });
+    await attack();
+    expect(midiCalls).toHaveLength(1);
+    const mo = midiCalls[0].usage.midiOptions;
+    expect([...mo.targetsToUse].map((t: any) => t.id)).toEqual(['brakka']);
+    expect(mo).toMatchObject({
+      autoRollAttack: true,
+      fastForwardAttack: true,
+      autoRollDamage: 'onHit',
+      fastForwardDamage: true,
+      workflowOptions: {
+        attackMode: 'oneHanded',
+        targetConfirmation: 'none',
+        noProvokeReaction: true,
+      },
+    });
+    expect(midiCalls[0].dialog).toEqual({ configure: false });
+  });
+
+  it("the hit is Midi's: a total above the target's own AC misses when Midi's AC (cover) is higher", async () => {
+    world({ targetFeet: 5, targetCover: 5 });
+    d20Queue = [14]; // 14 + 4 = 18: at least the target's own AC 16, below Midi's 16 + 5 = 21
+    const res = await attack();
+    const r = res.results[0];
+    expect(r.attackTotal).toBe(18);
+    expect(r.hit).toBe(false);
+    expect(r.targetAC).toBe(21);
+    expect(r.targetBaseAC).toBe(16);
+    expect(r.damage).toBe(0);
+  });
+
+  it('total cover: a miss, and the answer says total cover', async () => {
+    world({ targetFeet: 5, targetCover: Infinity });
+    d20Queue = [19];
+    const res = await attack();
+    expect(res.results[0].hit).toBe(false);
+    expect(res.results[0].totalCover).toBe(true);
+    expect(res.results[0].targetAC).toBe(16); // a number, as the brain has always read it: the target's own AC
+  });
+
+  it("advantage is Midi's (a Midi flag, Pack Tactics as data), with Midi's own reason", async () => {
+    const dagger = makeDagger(1);
+    world({
+      targetFeet: 5,
+      dagger,
+      attackerItems: [dagger],
+      attackerFlags: { 'midi-qol': { advantage: { attack: { all: 'true' } } } },
+    });
+    const res = await attack();
+    expect(rollCalls[0].config).toEqual({ attackMode: 'oneHanded', advantage: true });
+    const r = res.results[0];
+    expect(r.formula).toBe('2d20adv + 2 + 2');
+    expect(r.advantage).toBe(true);
+    expect(r.rollMode).toBe('advantage');
+    expect(r.advantageReasons).toEqual(['Pack Tactics - Advantage Attack (All)']);
+    expect(r.disadvantage).toBe(false);
+  });
+
+  it("a critical hit's damage dice are the engine's: the bridge rolls no dice of its own", async () => {
+    world({ targetFeet: 5 });
+    d20Queue = [20];
+    const res = await attack();
+    const r = res.results[0];
+    expect(r.crit).toBe(true);
+    expect(r.hit).toBe(true);
+    expect(damageCalls).toHaveLength(1);
+    expect(damageCalls[0]).toMatchObject({ isCritical: true });
+    expect(r.damageRolled).toBe(6); // 2d4 + 2 from the engine, not 1d4 + 2 plus dice of our own
+    expect(r.damageRolls).toEqual([{ formula: '2d4 + 2', total: 6, type: 'piercing' }]);
+    expect(res.ruleWarnings).toBeUndefined();
+  });
+
+  it("Midi's GM critical setting 'none' (it adds no dice): the critical is reported, not patched", async () => {
+    midiConfig.criticalDamageGM = 'none';
+    world({ targetFeet: 5 });
+    d20Queue = [20];
+    const res = await attack();
+    expect(res.results[0].damageRolled).toBe(4);
+    expect(res.ruleWarnings?.join(' ')).toMatch(/critical damage setting for the GM is 'none'/);
+  });
+
+  it("the damage is Midi's damage list, applied by Midi: resistance halves it, the bridge applies nothing", async () => {
+    const brakka = makeActor('Brakka', [], 20, 16, {}, { resist: ['piercing'] });
+    world({ targetFeet: 5, target: brakka });
+    d20Queue = [15];
+    const res = await attack();
+    const r = res.results[0];
+    expect(r.hit).toBe(true);
+    expect(r.damageRolled).toBe(4);
+    expect(r.damageApplied).toBe(2);
+    expect(r.damageDetail).toEqual([{ type: 'piercing', value: 2 }]);
+    expect(brakka.system.attributes.hp.value).toBe(18);
+    expect(r.hpAfter).toBe(18);
+    expect(r.damage).toBe(2);
+    expect(applyDamageCalls).toHaveLength(0);
+  });
+
+  it('Midi worked out damage but did not apply it (its setting): said, never hidden', async () => {
+    midiConfig.autoApplyDamage = 'no';
+    world({ targetFeet: 5 });
+    d20Queue = [15];
+    const res = await attack();
+    expect(res.results[0].hit).toBe(true);
+    expect(res.results[0].damage).toBe(0);
+    expect(res.ruleWarnings?.join(' ')).toMatch(/hit points did not change/);
+  });
+
+  it('a spell attack: dnd5e spends the slot inside the workflow; the bridge spends none of its own', async () => {
+    const bolt = makeWeapon({
+      name: 'Guiding Bolt',
+      type: 'spell',
+      quantity: 1,
+      level: 1,
+      range: { value: 120, long: null, units: 'ft' },
+      properties: [],
+      attackModes: [],
+      actionType: 'rsak',
+    });
+    const { kobold } = world({ targetFeet: 30, dagger: bolt, attackerItems: [bolt] });
+    kobold.system.spells = { spell1: { value: 2, max: 2 } };
+    d20Queue = [15];
+    const res = await attack('Guiding Bolt');
+    expect(res.success).toBe(true);
+    expect(midiCalls).toHaveLength(1);
+    expect(midiCalls[0].usage.midiOptions.workflowOptions.attackMode).toBeUndefined();
+    expect(kobold.system.spells.spell1.value).toBe(1);
+  });
+
+  it("a spell attack's answer has no attack mode (as before), though Midi's roll carries 'oneHanded'", async () => {
+    const bolt = makeWeapon({
+      name: 'Fire Bolt',
+      type: 'spell',
+      quantity: 1,
+      range: { value: 120, long: null, units: 'ft' },
+      properties: [],
+      attackModes: [],
+      actionType: 'rsak',
+    });
+    world({ targetFeet: 30, dagger: bolt, attackerItems: [bolt] });
+    const res = await attack('Fire Bolt');
+    expect(rollCalls[0].mode).toBe('oneHanded'); // what dnd5e/Midi put on the roll
+    expect(res.results[0].attackMode).toBeNull();
+    expect(res.results[0].thrown).toBe(false);
+  });
+
+  it('a levelled SAVE spell: dnd5e spends its slot inside the workflow; the bridge spends no second one', async () => {
+    const whispers = makeWeapon({
+      name: 'Dissonant Whispers',
+      type: 'spell',
+      quantity: 1,
+      level: 1,
+      range: { value: 60, long: null, units: 'ft' },
+      properties: [],
+      attackModes: [],
+      actionType: 'save',
+    });
+    const act = whispers.system.activities.contents[0];
+    act.type = 'save';
+    delete act.attack;
+    act.save = {};
+    const { kobold } = world({ targetFeet: 30, dagger: whispers, attackerItems: [whispers] });
+    kobold.system.spells = { spell1: { value: 2, max: 2 } };
+    const res = await attack('Dissonant Whispers');
+    expect(res.success).toBe(true);
+    expect(res.results[0].via).toBe('save');
+    expect(midiCalls).toHaveLength(1);
+    expect(kobold.system.spells.spell1.value).toBe(1);
+  });
+
+  it('every field the live brain reads is still there, plus what Midi decided', async () => {
+    world({ targetFeet: 10 });
+    const res = await attack();
+    const r = res.results[0];
+    for (const k of [
+      'target',
+      'hpBefore',
+      'hpAfter',
+      'damage',
+      'hit',
+      'crit',
+      'fumble',
+      'attackTotal',
+      'damageRolled',
+      'damageApplied',
+      'damageType',
+      'targetAC',
+      'via',
+      'error',
+      'formula',
+      'attackMode',
+      'thrown',
+      'remaining',
+      'usedUp',
+      'disadvantage',
+      'disadvantageReasons',
+      'rangeVerdict',
+      'distanceFt',
+    ])
+      expect(r).toHaveProperty(k);
+    expect(r.via).toBe('attack');
+    expect(r.engine).toBe('midi-qol');
+    expect(r.reactions).toBe('off');
+    expect(r.midiState).toBe('WorkflowState_Cleanup');
+    expect(res.attackerId).toBe('kobold');
+    expect(res.itemId).toBe('itemDagger');
+  });
+});
+
+describe('a Midi-QOL workflow that never finishes is stopped and said, never a hung fight', () => {
+  it('a roll dialog nobody can answer: stopped after the wait, the dialog closed, the workflow aborted', async () => {
+    const dagger = makeDagger(2, { midiProperties: { forceRollDialog: 'always' } });
+    world({
+      targetFeet: 5,
+      dagger,
+      attackerItems: [dagger],
+      extraTokens: [
+        {
+          id: 'nim',
+          name: 'Nim',
+          sq: 1,
+          sy: 1,
+          disposition: 1,
+          actor: makeActor('Nim', [], 10, 13),
+        },
+      ],
+    });
+    const res = await attack('Dagger', ['brakka', 'nim']);
+    const [a, b] = res.results;
+    expect(a.hit).toBe(false);
+    expect(a.error).toMatch(/did not finish within/);
+    expect(a.error).toMatch(/stopped at WorkflowState_WaitForAttackRoll/);
+    expect(a.error).toMatch(/AttackRollConfigurationDialog/);
+    expect(openApps.size).toBe(0);
+    expect([...liveWorkflows.values()][0].abortedByBridge).toBe(true);
+    // the second target is not attacked into the same stuck engine
+    expect(midiCalls).toHaveLength(1);
+    expect(b.error).toMatch(/^not attacked: /);
+    expect(res.ruleWarnings?.join(' ')).toMatch(/did not go through Midi-QOL's workflow/);
+  });
+
+  it("reactions switched on (the caller asks) and a target with one: Midi's crash without DAE is stopped and said", async () => {
+    const knight = makeActor('Brakka', [], 20, 16, {}, { reactions: ['Parry'] });
+    world({ targetFeet: 5, target: knight });
+    d20Queue = [15];
+    const res = await attack('Dagger', ['brakka'], undefined, { reactions: true });
+    expect(midiCalls[0].usage.midiOptions.workflowOptions.noProvokeReaction).toBeUndefined();
+    expect(res.results[0].error).toMatch(/stopped at WorkflowState_AttackRollComplete/);
+    expect(res.results[0].reactions).toBe('on');
+    expect(knight.system.attributes.hp.value).toBe(20);
+  });
+
+  it('reactions off (the default): the same hit on the same target goes through', async () => {
+    const knight = makeActor('Brakka', [], 20, 16, {}, { reactions: ['Parry'] });
+    world({ targetFeet: 5, target: knight });
+    d20Queue = [15];
+    const res = await attack();
+    expect(res.results[0].hit).toBe(true);
+    expect(res.results[0].error).toBeNull();
+    expect(knight.system.attributes.hp.value).toBe(16);
+  });
 });
 
 describe('FS-07: a Dagger kobold at 10, 45 and 70 ft', () => {
@@ -415,23 +931,25 @@ describe('FS-07: a Dagger kobold at 10, 45 and 70 ft', () => {
     expect(r.remaining).toBe(0);
   });
 
-  it('45 ft: thrown WITH disadvantage (long range), and the roll shows it', async () => {
+  it("45 ft: thrown WITH disadvantage, decided by Midi-QOL's workflow, with Midi's reason", async () => {
     world({ targetFeet: 45 });
     const res = await attack();
+    expect(midiCalls[0].usage.midiOptions.workflowOptions.attackMode).toBe('thrown');
+    expect(midiCalls[0].usage.midiOptions.disadvantage).toBeUndefined();
     expect(rollCalls[0].config).toEqual({ attackMode: 'thrown', disadvantage: true });
-    expect(rollCalls[0].advantageMode).toBe(-1);
     const r = res.results[0];
     expect(r.formula).toBe('2d20dis + 2 + 2');
     expect(r.disadvantage).toBe(true);
-    expect(r.disadvantageReasons).toEqual(['long range']);
+    expect(r.disadvantageReasons).toEqual(['Long Range']);
     expect(r.rangeVerdict).toBe('dis');
   });
 
-  it('70 ft: refused with the distance Midi-QOL measured and the weapon range; nothing rolled', async () => {
+  it('70 ft: refused with the distance Midi-QOL measured and the weapon range; Midi is not asked to roll', async () => {
     const { dagger } = world({ targetFeet: 70 });
     const res = await attack();
     expect(res.refused).toBe(true);
     expect(rollCalls).toHaveLength(0);
+    expect(midiCalls).toHaveLength(0);
     const r = res.results[0];
     expect(r.outOfRange).toBe(true);
     expect(r.distanceFt).toBe(70);
@@ -466,7 +984,7 @@ describe('a refusal says why (#1761)', () => {
   });
 });
 
-describe('the attack mode is always the one the rules give', () => {
+describe('the attack mode is always named', () => {
   it('adjacent (5 ft): a melee stab, the Dagger is kept, even when dnd5e remembers a throw', async () => {
     const dagger = makeDagger(2, { remembered: 'thrown' });
     world({ targetFeet: 5, dagger });
@@ -476,7 +994,7 @@ describe('the attack mode is always the one the rules give', () => {
     expect(rollCalls[0].mode).toBe('oneHanded');
     expect(res.results[0].thrown).toBe(false);
     expect(dagger.system.quantity).toBe(2);
-    expect(damageCalls[0]).toEqual({ attackMode: 'oneHanded' });
+    expect(damageCalls[0]).toMatchObject({ attackMode: 'oneHanded' });
   });
 
   it('a Returning weapon is thrown and dnd5e keeps its quantity', async () => {
@@ -504,8 +1022,8 @@ describe('the attack mode is always the one the rules give', () => {
   });
 });
 
-describe('a used-up weapon is never used again', () => {
-  it('quantity 0: refused, says so, and dnd5e is never asked to roll', async () => {
+describe('a used-up weapon is never used again (HOUSE RULE, moves to the aidm-rules add-on)', () => {
+  it('quantity 0: refused, says so, and the engine is never asked', async () => {
     world({ targetFeet: 10, dagger: makeDagger(0) });
     const res = await attack();
     expect(res.refused).toBe(true);
@@ -514,6 +1032,7 @@ describe('a used-up weapon is never used again', () => {
       'Kobold Warrior has no Dagger left to attack with (all of them were used up)'
     );
     expect(rollCalls).toHaveLength(0);
+    expect(midiCalls).toHaveLength(0);
     expect(warnings).toHaveLength(0);
   });
 
@@ -532,74 +1051,49 @@ describe('a used-up weapon is never used again', () => {
   });
 });
 
-describe('ranged attacks in close combat (Midi-QOL nearbyFoe)', () => {
-  it('a throw with an enemy standing next to the thrower who can see it: disadvantage', async () => {
-    world({
-      targetFeet: 15,
-      extraTokens: [
-        { id: 'oren', name: 'Oren', sq: 0, sy: 1, disposition: 1, actor: makeActor('Oren', []) },
-      ],
-    });
+describe("ranged attacks in close combat: Midi-QOL's own rule, as the world has it set", () => {
+  const orenNextToTheThrower = () => ({
+    id: 'oren',
+    name: 'Oren',
+    sq: 0,
+    sy: 1,
+    disposition: 1,
+    actor: makeActor('Oren', []),
+  });
+
+  it("Midi's optional rules OFF (both worlds today): no close-combat disadvantage, and the bridge adds none", async () => {
+    world({ targetFeet: 15, extraTokens: [orenNextToTheThrower()] });
+    const res = await attack();
+    expect(rollCalls[0].config).toEqual({ attackMode: 'thrown' });
+    expect(res.results[0].disadvantage).toBe(false);
+    expect(res.results[0].disadvantageReasons).toEqual([]);
+  });
+
+  it("Midi's optional rules ON: Midi gives the disadvantage and its reason is passed on", async () => {
+    midiConfig.optionalRulesEnabled = true;
+    world({ targetFeet: 15, extraTokens: [orenNextToTheThrower()] });
     const res = await attack();
     expect(rollCalls[0].config).toEqual({ attackMode: 'thrown', disadvantage: true });
-    expect(res.results[0].disadvantageReasons).toEqual([
-      'an enemy within 5 ft can see the attacker',
-    ]);
+    expect(res.results[0].disadvantageReasons).toEqual(['Nearby foe']);
   });
 
-  it('an enemy next to the thrower that cannot see it: no disadvantage', async () => {
-    world({
-      targetFeet: 15,
-      extraTokens: [
-        {
-          id: 'oren',
-          name: 'Oren',
-          sq: 0,
-          sy: 1,
-          disposition: 1,
-          actor: makeActor('Oren', []),
-          seesAttacker: false,
-        },
-      ],
-    });
-    await attack();
-    expect(rollCalls[0].config).toEqual({ attackMode: 'thrown' });
-  });
-
-  it("Midi-QOL's own opt-out on the thrower (ignoreNearbyFoes): no disadvantage", async () => {
+  it("optional rules ON and Midi's own opt-out on the thrower (ignoreNearbyFoes): no disadvantage", async () => {
+    midiConfig.optionalRulesEnabled = true;
     const dagger = makeDagger(1);
     world({
       targetFeet: 15,
       dagger,
       attackerItems: [dagger],
-      attackerFlags: { 'midi-qol': { ignoreNearbyFoes: '1' } },
-      extraTokens: [
-        { id: 'oren', name: 'Oren', sq: 0, sy: 1, disposition: 1, actor: makeActor('Oren', []) },
-      ],
+      attackerFlags: { 'midi-qol': { ignoreNearbyFoes: 'true' } },
+      extraTokens: [orenNextToTheThrower()],
     });
     await attack();
     expect(rollCalls[0].config).toEqual({ attackMode: 'thrown' });
   });
 
-  it('the rule switched off in Midi-QOL (nearbyFoe 0): no disadvantage', async () => {
-    midiRules.nearbyFoe = 0;
-    world({
-      targetFeet: 15,
-      extraTokens: [
-        { id: 'oren', name: 'Oren', sq: 0, sy: 1, disposition: 1, actor: makeActor('Oren', []) },
-      ],
-    });
-    await attack();
-    expect(rollCalls[0].config).toEqual({ attackMode: 'thrown' });
-  });
-
-  it('a melee stab with an enemy next to the attacker: no disadvantage (unchanged)', async () => {
-    world({
-      targetFeet: 5,
-      extraTokens: [
-        { id: 'oren', name: 'Oren', sq: 0, sy: 1, disposition: 1, actor: makeActor('Oren', []) },
-      ],
-    });
+  it('guard: a melee stab with an enemy next to the attacker, no disadvantage', async () => {
+    midiConfig.optionalRulesEnabled = true;
+    world({ targetFeet: 5, extraTokens: [orenNextToTheThrower()] });
     await attack();
     expect(rollCalls[0].config.disadvantage).toBeUndefined();
     expect(rollCalls[0].advantageMode).toBe(0);
@@ -638,7 +1132,8 @@ describe('unchanged behaviour (guards)', () => {
 // the 2024 rules), never added to the monster. The stand-in below follows what the test stack measured
 // on 2026-09-27 for a Kobold Warrior (Str 7, PB 2): before dnd5e's final item preparation the attack
 // was `1d20 - 2` (no proficiency) and no damage was rolled; after it, `1d20 - 2 + 2` and `1 - 2`
-// bludgeoning. dnd5e only remembers the last attack mode on an item its actor holds.
+// bludgeoning. dnd5e only remembers the last attack mode on an item its actor holds. Bridge 0.10.8: the
+// temporary item goes through Midi-QOL's workflow like any weapon (measured on the test stack: it does).
 // ================================================================================================
 let uuidAsked: string[] = [];
 let unarmedLoads = true;
@@ -662,10 +1157,12 @@ class FakeItem5e {
     const item = this;
     const activity: any = {
       id: 'X96HnXRaVti0SXqJ',
+      uuid: 'temp.Activity.X96HnXRaVti0SXqJ',
       type: 'attack',
       actionType: 'mwak',
       attack: { ability: 'str' },
       item,
+      midiProperties: {},
       async rollAttack(config: any = {}) {
         const die = d20Queue.length ? d20Queue.shift()! : 10;
         const prof = item.prepared ? 2 : 0;
@@ -674,7 +1171,7 @@ class FakeItem5e {
           total: die - 2 + prof,
           isCritical: die === 20,
           isFumble: die === 1,
-          options: { attackMode: config.attackMode ?? 'oneHanded' },
+          options: { attackMode: config.attackMode ?? 'oneHanded', advantageMode: 0 },
         };
         // dnd5e 5.3.3: `this.actor.items.has(this.item.id)` guards the remembered-mode write.
         if (item.parent?.items?.has?.(item.id))
@@ -735,7 +1232,7 @@ describe('no weapon left: an Unarmed Strike, the dnd5e way (operator "Unarmed St
     delete g.CONFIG;
   });
 
-  it("uses dnd5e's own 2024 Unarmed Strike, fully prepared, and adds nothing to the monster", async () => {
+  it("uses dnd5e's own 2024 Unarmed Strike, fully prepared, through Midi, and adds nothing to the monster", async () => {
     const { kobold } = world({ targetFeet: 5, dagger: makeDagger(0) });
     withDnd5eUnarmedStrike();
     d20Queue = [18]; // 18 - 2 + 2 = 18 hits AC 16
@@ -743,6 +1240,7 @@ describe('no weapon left: an Unarmed Strike, the dnd5e way (operator "Unarmed St
     expect(uuidAsked).toEqual(['Compendium.dnd5e.equipment24.Item.phbUnarmedStrike']);
     expect(res.success).toBe(true);
     expect(res.item).toBe('Unarmed Strike');
+    expect(midiCalls).toHaveLength(1);
     expect(rollCalls).toHaveLength(1);
     expect(rollCalls[0].prepared).toBe(true); // Str + proficiency, as dnd5e prepares it
     expect(rollCalls[0].config.attackMode).toBe('oneHanded');
@@ -756,7 +1254,7 @@ describe('no weapon left: an Unarmed Strike, the dnd5e way (operator "Unarmed St
     expect(kobold.items.get('itemDagger').system.quantity).toBe(0);
   });
 
-  it('a hit whose damage roll is below 0 deals 0 and never heals the target', async () => {
+  it("a hit whose damage roll is below 0 deals 0 (Midi's own floor) and never heals the target", async () => {
     const { brakka } = world({ targetFeet: 5, dagger: makeDagger(0) });
     withDnd5eUnarmedStrike();
     d20Queue = [18]; // 18 - 2 + 2 = 18 hits AC 16
@@ -815,8 +1313,8 @@ describe('no weapon left: an Unarmed Strike, the dnd5e way (operator "Unarmed St
   });
 });
 
-describe("damage below 0 deals 0 for every weapon (dnd5e's own rule when it applies damage)", () => {
-  it('a Dagger damage roll of -1 leaves the target untouched (it used to heal 1)', async () => {
+describe("damage below 0 deals 0 for every weapon (Midi-QOL's own floor)", () => {
+  it('a Dagger damage roll of -1 leaves the target untouched', async () => {
     const dagger = makeDagger(1);
     dagger.system.activities.contents[0].rollDamage = async (config: any = {}) => {
       damageCalls.push({ ...config });
@@ -844,15 +1342,6 @@ function javelin(id: string, quantity: number) {
     attackModes: [{ value: 'oneHanded' }, { rule: true }, { value: 'thrown' }],
   });
 }
-
-const orenNextToTheThrower = () => ({
-  id: 'oren',
-  name: 'Oren',
-  sq: 0,
-  sy: 1,
-  disposition: 1,
-  actor: makeActor('Oren', []),
-});
 
 describe('finding 2: which item an attack by name means', () => {
   it('an empty Javelin stack next to a new one: the new stack is thrown, not refused', async () => {
@@ -895,8 +1384,8 @@ describe('finding 2: which item an attack by name means', () => {
   });
 });
 
-describe('finding 5: a rule the engine could not apply is reported, never dropped quietly', () => {
-  it("Midi-QOL's settings cannot be read: the attack goes on and the answer says the defaults were used", async () => {
+describe('finding 5: a check the engine could not make is reported, never dropped quietly', () => {
+  it("Midi-QOL's settings cannot be read: the attack goes on and the answer says the default was used", async () => {
     midiThrows.settings = true;
     world({ targetFeet: 10 });
     const res = await attack();
@@ -904,15 +1393,7 @@ describe('finding 5: a rule the engine could not apply is reported, never droppe
     expect(res.ruleWarnings?.join(' ')).toMatch(/settings could not be read/);
   });
 
-  it('the close-combat check throws: reported (it used to drop the disadvantage silently)', async () => {
-    midiThrows.checkNearby = true;
-    world({ targetFeet: 15, extraTokens: [orenNextToTheThrower()] });
-    const res = await attack();
-    expect(rollCalls[0].config).toEqual({ attackMode: 'thrown' });
-    expect(res.ruleWarnings?.join(' ')).toMatch(/close-combat check failed/);
-  });
-
-  it('the range check throws: reported (no long-range disadvantage could be applied)', async () => {
+  it('the range check throws: reported', async () => {
     midiThrows.checkActivityRange = true;
     world({ targetFeet: 45 });
     const res = await attack();
@@ -949,60 +1430,6 @@ describe('finding 5: a rule the engine could not apply is reported, never droppe
   });
 });
 
-describe("finding 5: Midi-QOL's ignoreNearbyFoes is a condition, evaluated the way Midi does", () => {
-  it('a condition that evaluates FALSE does not switch the rule off: disadvantage applies', async () => {
-    const dagger = makeDagger(1);
-    world({
-      targetFeet: 15,
-      dagger,
-      attackerItems: [dagger],
-      attackerFlags: { 'midi-qol': { ignoreNearbyFoes: 'false' } },
-      extraTokens: [orenNextToTheThrower()],
-    });
-    const res = await attack();
-    expect(rollCalls[0].config).toEqual({ attackMode: 'thrown', disadvantage: true });
-    expect(res.ruleWarnings).toBeUndefined();
-  });
-
-  it("Midi's evaluator is missing: the flag counts as set, and the answer says it could not be evaluated", async () => {
-    midiNoEvaluator = true;
-    const dagger = makeDagger(1);
-    world({
-      targetFeet: 15,
-      dagger,
-      attackerItems: [dagger],
-      attackerFlags: { 'midi-qol': { ignoreNearbyFoes: 'false' } },
-      extraTokens: [orenNextToTheThrower()],
-    });
-    const res = await attack();
-    expect(rollCalls[0].config).toEqual({ attackMode: 'thrown' });
-    expect(res.ruleWarnings?.join(' ')).toMatch(/evaluator \(evalAllConditions\) is not available/);
-  });
-
-  it('the evaluator throws: the flag counts as set, and the answer says so', async () => {
-    midiThrows.evalAllConditions = true;
-    const dagger = makeDagger(1);
-    world({
-      targetFeet: 15,
-      dagger,
-      attackerItems: [dagger],
-      attackerFlags: { 'midi-qol': { ignoreNearbyFoes: 'true' } },
-      extraTokens: [orenNextToTheThrower()],
-    });
-    const res = await attack();
-    expect(rollCalls[0].config).toEqual({ attackMode: 'thrown' });
-    expect(res.ruleWarnings?.join(' ')).toMatch(/could not evaluate/);
-  });
-
-  it('guard: no flag at all, nothing is evaluated and nothing is reported', async () => {
-    midiNoEvaluator = true;
-    world({ targetFeet: 15, extraTokens: [orenNextToTheThrower()] });
-    const res = await attack();
-    expect(rollCalls[0].config).toEqual({ attackMode: 'thrown', disadvantage: true });
-    expect(res.ruleWarnings).toBeUndefined();
-  });
-});
-
 // ================================================================================================
 // Board #1887, re-review of fork 876a95d (HOLD): the brain gives a character back what it threw after a fight, so the
 // answer must say how many the roll REALLY used up (quantity before minus after), not "the mode was thrown".
@@ -1028,12 +1455,10 @@ describe('usedUp: how many the roll really used up', () => {
     expect(dagger.system.quantity).toBe(1);
   });
 
-  it('a roll that failed uses nothing up, and says why', async () => {
+  it('a workflow that failed uses nothing up, and says why', async () => {
     const dagger = makeDagger(1);
     world({ targetFeet: 10, dagger, attackerItems: [dagger] });
-    dagger.system.activities.contents[0].rollAttack = async () => {
-      throw new Error('the roll dialog was closed');
-    };
+    midiThrows.completeActivityUse = true;
     const res = await attack();
     expect(res.results[0].thrown).toBe(true);
     expect(res.results[0].usedUp).toBe(0);

@@ -20,10 +20,20 @@
  *   mode given uses that remembered mode: after one throw, a plain `rollAttack({})` is rolled as a
  *   throw again. So the mode is always passed explicitly here.
  * - At quantity 0 it only shows a warning and still rolls. By the rules there is no weapon left to
- *   attack with, so execute-attack refuses instead.
+ *   attack with, so execute-attack refuses instead. (HOUSE RULE, board #1887 bridge 0.10.8: neither
+ *   dnd5e 5.3.3 nor Midi-QOL 14.0.12 has a setting that refuses it; dnd5e's `rollAttack` only warns,
+ *   attack.mjs line 88. It moves to the aidm-rules add-on, orchestrator 2026-09-27.)
+ *
+ * Bridge 0.10.8 (board #1887, engine map M07, operator 2026-09-27 "let Foundry handle the rules"):
+ * the attack itself is no longer rolled here. `execute-attack` runs Midi-QOL's OWN attack workflow
+ * (`MidiQOL.completeActivityUse`) and only READS BACK what the engine decided: the hit, the critical,
+ * the advantage and its reasons, the AC it compared with, the damage after resistances. The helpers
+ * that did the rules by hand (0.10.7's `rangeRollAdvantage`, `midiIgnoresNearbyFoes`, `appliedDamage`,
+ * and the hand-rolled critical dice in queries.ts) are gone; `midiAttackOptions`, `readMidiAttack` and
+ * `midiCriticalDamageProblem` below replace them.
  *
  * These functions carry no dependency on Foundry's browser globals (the same discipline as
- * combat-scoping-utils.ts), so the rules can be unit tested with plain vitest. queries.ts asks
+ * combat-scoping-utils.ts), so they can be unit tested with plain vitest. queries.ts asks
  * Midi-QOL and dnd5e and hands the answers in as plain data.
  */
 
@@ -84,105 +94,10 @@ export function chooseAttackMode(input: AttackModeInput): AttackModeChoice {
   return { mode: first, thrown: first.startsWith('thrown') };
 }
 
-export interface RollAdvantageInput {
-  /** Midi-QOL's range verdict for the target. */
-  verdict?: RangeVerdict | undefined;
-  /** The attack is a ranged attack roll: a ranged weapon or spell attack, or a thrown weapon. */
-  rangedAttack: boolean;
-  /** Midi-QOL's `checkNearby` answer: an enemy who can see the attacker stands within Midi's
-   * "nearby foe" distance (its optional rule, 5 ft on our worlds; 0 = the rule is off). */
-  foeNearby: boolean;
-}
-
-export interface RollAdvantage {
-  disadvantage: boolean;
-  /** Plain words, one per reason, for the result and the log. */
-  reasons: string[];
-}
-
-/**
- * The disadvantage the range rules give an attack roll (PHB 2024, "Ranged Attacks"): beyond normal
- * range ("Long Range"), and a ranged attack roll made within 5 feet of an enemy who can see you
- * ("Ranged Attacks in Close Combat"). Both answers are Midi-QOL's own; its workflow applies them the
- * same way (`longRangeAttack` and its `nearbyFoe` rule), and execute-attack bypasses that workflow.
- */
-export function rangeRollAdvantage(input: RollAdvantageInput): RollAdvantage {
-  const reasons: string[] = [];
-  if (input.verdict === 'dis') reasons.push('long range');
-  if (input.rangedAttack && input.foeNearby)
-    reasons.push('an enemy within 5 ft can see the attacker');
-  return { disadvantage: reasons.length > 0, reasons };
-}
-
 /** True when a weapon has none left to attack with: dnd5e's own quantity is 0 (a thrown weapon that
  * was used up). Only weapons count; an item without a numeric quantity is never refused here. */
 export function weaponUsedUp(item: { type?: string; quantity?: unknown }): boolean {
   return item?.type === 'weapon' && typeof item.quantity === 'number' && item.quantity <= 0;
-}
-
-/** Midi-QOL's own flag for "this attacker ignores the close-combat rule" (Crossbow Expert and the like). */
-export const MIDI_IGNORE_NEARBY_FOES = 'flags.midi-qol.ignoreNearbyFoes';
-
-/**
- * Does Midi-QOL's own `ignoreNearbyFoes` opt-out apply to this attack? (board #1887, independent review of bridge
- * 0.10.7, finding 5.) In Midi-QOL the flag is a CONDITION, not a plain on/off: its workflow evaluates it with
- * `evalAllConditionsAsync(actor, 'flags.midi-qol.ignoreNearbyFoes', createConditionData({workflow, target, actor}))`
- * (Workflow.ts, 14.0.12), which evaluates each applied effect's change with that key, or the actor's own flag, as a
- * condition expression. 0.10.7 as first built took any value that is set (even one that evaluates false) as "ignore".
- * Here the flag is evaluated with Midi-QOL's own public `evalAllConditions` and `createConditionData` (the synchronous
- * twins of what its workflow uses). With no flag and no such effect, the answer is false and nothing is evaluated.
- * When Midi cannot evaluate it (the function is missing or throws), `warn` is told and the flag counts as set, as
- * before. Midi and the tokens are passed in, so no Foundry global is touched here.
- */
-export function midiIgnoresNearbyFoes(
-  midi: any,
-  attackerToken: any,
-  targetToken: any,
-  activity: any,
-  item: any,
-  warn: (what: string, e: any) => void
-): boolean {
-  const actor = attackerToken?.actor;
-  if (!actor) return false;
-  let effects: any[] = [];
-  try {
-    effects = [...(actor.appliedEffects ?? [])].filter((ef: any) =>
-      (ef?.system?.changes ?? ef?.changes ?? []).some(
-        (c: any) => c?.key === MIDI_IGNORE_NEARBY_FOES
-      )
-    );
-  } catch (e) {
-    effects = [];
-  }
-  const plain = actor.flags?.['midi-qol']?.ignoreNearbyFoes;
-  const plainSet = !(plain === undefined || plain === null || plain === '' || plain === false);
-  if (!effects.length && !plainSet) return false;
-  const fallback = plainSet || effects.length > 0;
-  if (typeof midi?.evalAllConditions !== 'function') {
-    warn(
-      "Midi-QOL's condition evaluator (evalAllConditions) is not available, so the attacker's ignoreNearbyFoes flag was taken as set",
-      'not available'
-    );
-    return fallback;
-  }
-  try {
-    const data =
-      typeof midi.createConditionData === 'function'
-        ? midi.createConditionData({
-            actor,
-            target: targetToken?.object ?? targetToken,
-            activity,
-            item,
-          })
-        : {};
-    return !!midi.evalAllConditions(actor, MIDI_IGNORE_NEARBY_FOES, data);
-  } catch (e) {
-    warn(
-      "Midi-QOL could not evaluate the attacker's ignoreNearbyFoes condition, so it was taken as set",
-      e
-    );
-    return fallback;
-  }
 }
 
 /**
@@ -257,29 +172,6 @@ export function unarmedStrikeUuid(rulesVersion: unknown): string {
   return rulesVersion === 'legacy' ? UNARMED_STRIKE_UUID.legacy : UNARMED_STRIKE_UUID.modern;
 }
 
-export interface DamagePart {
-  total: number | null | undefined;
-  type?: string | null | undefined;
-}
-
-/**
- * The damage dnd5e applies for a set of damage rolls: the rolls summed per damage type, and a type whose total is
- * below 0 counts as 0. That is dnd5e 5.3.3's own rule when it applies damage from its chat card
- * (`ChatMessage5e#applyChatCardDamage` and the card's damage application: `Math.max(0, roll.total)` per aggregated
- * roll). `Actor5e#applyDamage` itself has no floor: handed a negative number it HEALS. Measured on the test stack: a
- * Kobold Warrior's Unarmed Strike (Str 7) rolls `1 - 2` = -1, which must apply as 0, not heal the target by 1.
- */
-export function appliedDamage(parts: DamagePart[]): number {
-  const byType = new Map<string, number>();
-  for (const p of parts || []) {
-    const k = String(p?.type ?? '');
-    byType.set(k, (byType.get(k) ?? 0) + (Number(p?.total) || 0));
-  }
-  let sum = 0;
-  for (const v of byType.values()) sum += Math.max(0, v);
-  return sum;
-}
-
 export interface RangeRefusalInput {
   targetName: string;
   itemName: string;
@@ -329,4 +221,278 @@ export function describeRangeRefusal(input: RangeRefusalInput): RangeRefusal {
     note: `${input.targetName} is out of the range of ${input.itemName}${rng}`,
     outOfRange: true,
   };
+}
+
+// ================================================================================================
+// Bridge 0.10.8 (board #1887, engine map M07): the attack runs through Midi-QOL's OWN workflow, and
+// execute-attack reads back what the engine decided.
+// ================================================================================================
+
+export interface MidiAttackOptionsInput {
+  /** The dnd5e attack mode (chooseAttackMode). Midi-QOL 14.0.12 opens its roll dialog for any weapon with the Thrown
+   * property unless a mode is named in `workflowOptions.attackMode` (AttackActivity.ts, `rollAttack`); nobody can
+   * answer a dialog in the headless GM browser, so the workflow waits for ever (measured on the test stack
+   * 2026-09-27: 20 s and still waiting in WaitForAttackRoll, an AttackRollConfigurationDialog open). */
+  attackMode?: string | undefined;
+  /** Let Midi-QOL run reactions (Shield, Parry). Off unless the caller asks; see midiAttackOptions. */
+  reactions?: boolean | undefined;
+}
+
+/**
+ * The `usage.midiOptions` execute-attack hands to `MidiQOL.completeActivityUse` (the caller adds `targetsToUse`).
+ * Only automation for a GM with no hands; nothing here changes a rule:
+ * - autoRollAttack, fastForwardAttack, autoRollDamage 'onHit', fastForwardDamage: no chat-card button and no roll
+ *   dialog waits for a click. Midi-QOL 14.0.12 reads the GM's fast-forward from `gmAutoFastForward` (an array); the
+ *   test world holds [] there (gmhost writes Midi 13's keys), so without these a GM roll would open a dialog.
+ * - workflowOptions.attackMode: see MidiAttackOptionsInput.
+ * - workflowOptions.targetConfirmation 'none': Midi's target confirmation dialog never opens; the target is given.
+ * - workflowOptions.noProvokeReaction (unless `reactions` is true): Midi-QOL's own switch for "no reactions for this
+ *   attack". Measured 2026-09-27 on the test stack: Midi-QOL 14.0.12 REQUIRES the DAE add-on (its module.json) and our
+ *   worlds do not run DAE. When a target has a usable reaction (a Knight's Parry, on a hit), Midi asks the robot GM,
+ *   waits its reactionTimeout (10 s), then crashes in `doReactions` (`globalThis.DAE.actionQueue` of an undefined DAE)
+ *   and never applies the damage. 0.10.7 never ran reactions either, so this keeps today's game; turning them on is
+ *   the operator's decision.
+ */
+export function midiAttackOptions(input: MidiAttackOptionsInput): {
+  autoRollAttack: true;
+  fastForwardAttack: true;
+  autoRollDamage: 'onHit';
+  fastForwardDamage: true;
+  workflowOptions: Record<string, unknown>;
+} {
+  const workflowOptions: Record<string, unknown> = { targetConfirmation: 'none' };
+  if (input.attackMode) workflowOptions.attackMode = input.attackMode;
+  if (!input.reactions) workflowOptions.noProvokeReaction = true;
+  return {
+    autoRollAttack: true,
+    fastForwardAttack: true,
+    autoRollDamage: 'onHit',
+    fastForwardDamage: true,
+    workflowOptions,
+  };
+}
+
+/** Midi-QOL 14.0.12's critical damage choices (settings.ts, `criticalDamageChoices`). */
+export const MIDI_CRITICAL_DAMAGE_CHOICES: readonly string[] = [
+  'default',
+  'maxDamage',
+  'maxCrit',
+  'maxCritRoll',
+  'maxAll',
+  'doubleDice',
+  'explode',
+  'maxDamageExplode',
+  'explodeCharacter',
+  'explodeNPC',
+  'baseDamage',
+  'maxBaseRollCrit',
+  'bestOfTwo',
+];
+
+/**
+ * Plain words when Midi-QOL's critical damage setting for the GM is a value Midi does not handle; null otherwise.
+ * Midi-QOL 14.0.12 uses `criticalDamageGM` for every roll the GM makes (every roll execute-attack makes), and its own
+ * shipped default is 'none', which is not one of its choices: its critical switch (patching.ts, configureDamage) then
+ * adds NO critical dice and never calls dnd5e's own critical doubling. Measured 2026-09-27 on the test stack: a forced
+ * natural 20 with a Dagger rolled '1d4 + 2'. This is reported, not worked around: the fix is a world setting.
+ */
+export function midiCriticalDamageProblem(value: unknown): string | null {
+  if (typeof value === 'string' && MIDI_CRITICAL_DAMAGE_CHOICES.includes(value)) return null;
+  return (
+    `Midi-QOL's critical damage setting for the GM is '${String(value)}', which Midi-QOL does not handle: ` +
+    `a critical hit it rolls adds no critical dice (dnd5e's own rule doubles the damage dice). ` +
+    `It is a world setting (Midi-QOL, Workflow, Damage: critical damage for the GM)`
+  );
+}
+
+/** Which token a Midi-QOL workflow result is about: the token document's uuid (Midi keys its damage list and its hit
+ * display by it) and the token id. */
+export interface MidiTargetRef {
+  uuid?: string | null | undefined;
+  id?: string | null | undefined;
+}
+
+export interface MidiAttackReadback {
+  /** Midi-QOL's workflow finished and made an attack roll. */
+  ran: boolean;
+  /** The workflow state it ended in (`WorkflowState_Cleanup` for a finished attack). */
+  state: string | null;
+  hit: boolean;
+  crit: boolean;
+  fumble: boolean;
+  attackTotal: number | null;
+  formula: string | null;
+  attackMode: string | null;
+  /** The AC Midi-QOL compared the attack with (cover, reactions and its AC flags in); null for total cover or when
+   * Midi recorded none. */
+  targetAC: number | null;
+  /** The target's own AC before those (Midi's `baseAc`). */
+  targetBaseAC: number | null;
+  totalCover: boolean;
+  /** Midi-QOL's own words for how it got the AC (its hit card tooltip), when it has them. */
+  acDetail: string | null;
+  advantage: boolean;
+  disadvantage: boolean;
+  rollMode: 'advantage' | 'disadvantage' | 'normal';
+  /** Midi-QOL's reasons for the advantage the roll was made with (empty when it was not). */
+  advantageReasons: string[];
+  /** Midi-QOL's reasons for the disadvantage the roll was made with (empty when it was not). */
+  disadvantageReasons: string[];
+  /** Every source Midi-QOL recorded, by kind (ADV, DIS, NOADV, NODIS, CRIT, NOCRIT, FUMBLE, ...), even when they
+   * cancelled out. */
+  rollModifiers: Record<string, string[]>;
+  /** The damage rolls' totals added up, before resistances (may be below 0). 0 when no damage was rolled. */
+  damageRolled: number;
+  damageRolls: Array<{ formula: string | null; total: number | null; type: string | null }>;
+  damageType: string | null;
+  /** The damage Midi-QOL dealt this target: its damage list's total after the target's resistances, immunities and
+   * vulnerabilities, never below 0 (Midi's own floor). 0 on a miss. */
+  damageApplied: number;
+  /** That damage by type, after resistances. */
+  damageDetail: Array<{ type: string | null; value: number | null }>;
+  /** Temporary hit points it took. */
+  tempDamage: number;
+  /** The hit points Midi-QOL worked out for the target (its damage list's newHP), null when it dealt none. */
+  engineHpAfter: number | null;
+  error: string | null;
+}
+
+function tokenMatches(tok: any, ref: MidiTargetRef): boolean {
+  if (!tok) return false;
+  const uuid = tok?.document?.uuid ?? tok?.uuid;
+  const id = tok?.id ?? tok?.document?.id;
+  return (!!ref.uuid && uuid === ref.uuid) || (!!ref.id && id === ref.id);
+}
+
+function setHas(set: any, ref: MidiTargetRef): boolean {
+  if (!set) return false;
+  for (const t of set as Iterable<any>) if (tokenMatches(t, ref)) return true;
+  return false;
+}
+
+function num(v: unknown): number | null {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
+function stateName(wf: any): string | null {
+  const a = wf?.currentAction;
+  if (!a) return null;
+  const n = typeof a?.name === 'string' ? a.name : String(a);
+  return n ? String(n).replace(/^bound /, '') : null;
+}
+
+/**
+ * What Midi-QOL's attack workflow decided for one target, read from the workflow `completeActivityUse` returned. The
+ * fields are Midi-QOL 14.0.12's own (Workflow.ts): `hitTargets` / `hitTargetsEC` (checkHits), `isCritical`,
+ * `isFumble`, `attackRoll` (dnd5e's D20Roll, with `options.advantageMode` and `options.attackMode`), `attackTotal`,
+ * `attackRollModifierTracker.attribution` (every advantage and disadvantage source by kind), `hitDisplayData[token
+ * uuid]` (the AC it compared with, `ac`, and the target's own, `baseAc`), `damageRolls`, `damageList` (per target:
+ * `totalDamage` after resistances and floored at 0, `hpDamage`, `tempDamage`, `newHP`, `damageDetail`).
+ * No rule is worked out here: a missing field is reported as missing, never guessed.
+ */
+export function readMidiAttack(wf: any, ref: MidiTargetRef): MidiAttackReadback {
+  const out: MidiAttackReadback = {
+    ran: false,
+    state: stateName(wf),
+    hit: false,
+    crit: false,
+    fumble: false,
+    attackTotal: null,
+    formula: null,
+    attackMode: null,
+    targetAC: null,
+    targetBaseAC: null,
+    totalCover: false,
+    acDetail: null,
+    advantage: false,
+    disadvantage: false,
+    rollMode: 'normal',
+    advantageReasons: [],
+    disadvantageReasons: [],
+    rollModifiers: {},
+    damageRolled: 0,
+    damageRolls: [],
+    damageType: null,
+    damageApplied: 0,
+    damageDetail: [],
+    tempDamage: 0,
+    engineHpAfter: null,
+    error: null,
+  };
+  if (!wf || typeof wf !== 'object') {
+    out.error =
+      "Midi-QOL's attack workflow gave nothing back, so no attack was made (the item could not be used, or the workflow did not start)";
+    return out;
+  }
+  const roll = wf.attackRoll ?? null;
+  if (wf.aborted) {
+    out.error = `Midi-QOL stopped the attack (its workflow was aborted${out.state ? ` at ${out.state}` : ''})`;
+    return out;
+  }
+  if (!roll) {
+    out.error = `Midi-QOL's attack workflow ended with no attack roll${out.state ? ` (at ${out.state})` : ''}: its own checks stopped it`;
+    return out;
+  }
+  out.ran = true;
+  out.formula = typeof roll.formula === 'string' ? roll.formula : null;
+  out.attackMode = roll.options?.attackMode ?? wf.attackMode ?? null;
+  out.crit = !!wf.isCritical;
+  out.fumble = !!wf.isFumble;
+  out.hit = setHas(wf.hitTargets, ref) || setHas(wf.hitTargetsEC, ref);
+  const hd = (ref.uuid && wf.hitDisplayData?.[ref.uuid]) || null;
+  out.attackTotal = num(hd?.attackTotal) ?? num(wf.attackTotal) ?? num(roll.total);
+  if (hd) {
+    const ac = hd.ac;
+    if ((typeof ac === 'number' && !Number.isFinite(ac)) || hd.acDisplay === '∞')
+      out.totalCover = true;
+    out.targetAC = num(ac);
+    out.targetBaseAC = num(hd.baseAc);
+    out.acDetail = typeof hd.acTooltip === 'string' && hd.acTooltip ? hd.acTooltip : null;
+  }
+  // The roll itself says how it was made: dnd5e's D20Roll advantageMode (1 advantage, -1 disadvantage, 0 normal).
+  const mode = num(roll.options?.advantageMode);
+  const adv = mode !== null ? mode > 0 : !!roll.hasAdvantage;
+  const dis = mode !== null ? mode < 0 : !!roll.hasDisadvantage;
+  out.advantage = adv;
+  out.disadvantage = dis;
+  out.rollMode = adv ? 'advantage' : dis ? 'disadvantage' : 'normal';
+  const attribution = wf.attackRollModifierTracker?.attribution ?? {};
+  for (const [kind, sources] of Object.entries(
+    attribution as Record<string, Record<string, string>>
+  )) {
+    const names = Object.values(sources ?? {}).map(s => String(s));
+    if (names.length) out.rollModifiers[kind] = names;
+  }
+  if (adv) out.advantageReasons = out.rollModifiers.ADV ?? [];
+  if (dis) out.disadvantageReasons = out.rollModifiers.DIS ?? [];
+  const rolls = [
+    ...(Array.isArray(wf.damageRolls) ? wf.damageRolls : []),
+    ...(Array.isArray(wf.bonusDamageRolls) ? wf.bonusDamageRolls : []),
+  ].filter(Boolean);
+  out.damageRolls = rolls.map((r: any) => ({
+    formula: typeof r?.formula === 'string' ? r.formula : null,
+    total: num(r?.total),
+    type: r?.options?.type ?? null,
+  }));
+  out.damageRolled = out.damageRolls.reduce((s, r) => s + (r.total ?? 0), 0);
+  out.damageType = out.damageRolls[0]?.type ?? null;
+  if (out.hit) {
+    const entry = (Array.isArray(wf.damageList) ? wf.damageList : []).find(
+      (d: any) =>
+        (!!ref.uuid && d?.targetUuid === ref.uuid) ||
+        (!!ref.id && String(d?.targetUuid ?? '').endsWith(`.${ref.id}`))
+    );
+    if (entry) {
+      out.damageApplied = Math.max(0, num(entry.totalDamage) ?? 0);
+      out.tempDamage = Math.max(0, num(entry.tempDamage) ?? 0);
+      out.engineHpAfter = num(entry.newHP);
+      out.damageDetail = (Array.isArray(entry.damageDetail) ? entry.damageDetail : []).map(
+        (x: any) => ({
+          type: x?.type ?? null,
+          value: num(x?.value),
+        })
+      );
+    }
+  }
+  return out;
 }
