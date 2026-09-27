@@ -37,6 +37,12 @@ import {
 } from './combat-scoping-utils.js';
 import { staleCombatIdsToDelete } from './combat-cleanup-utils.js';
 import { AidmModuleHandlers } from './aidm-module-handlers.js';
+import {
+  chooseAttackMode,
+  rangeRollAdvantage,
+  weaponUsedUp,
+  describeRangeRefusal,
+} from './attack-rules-utils.js';
 
 // Board #1714 review: adventure-import and adventure-source-backfill apply both plan from live
 // state and then write. This module-level lock makes those calls run one at a time INSIDE THIS ONE
@@ -2526,6 +2532,30 @@ export class QueryHandlers {
     if (!targetToks.length && (isHeal || isBuff)) targetToks = [attTok];
     if (!targetToks.length) throw new Error('No valid targets');
     const results: any[] = [];
+    // Board #1887 (bridge 0.10.7): a weapon whose quantity is 0 has been used up (a thrown weapon that
+    // was thrown). dnd5e 5.3.3 only warns and still rolls; by the rules there is nothing left to
+    // attack with, so the attack is refused and says why.
+    if (weaponUsedUp({ type: item.type, quantity: item.system?.quantity })) {
+      for (const t of targetToks)
+        results.push({
+          target: t.name,
+          hit: false,
+          noWeaponLeft: true,
+          note: `${attTok.name} has no ${item.name} left to attack with (all of them were used up)`,
+        });
+      return { success: false, attacker: attTok.name, item: item.name, results, refused: true };
+    }
+    // Midi-QOL's own settings, read once: its wall rule for range (`wallsBlockRange`) and its
+    // "nearby foe" distance for ranged attacks in close combat (`nearbyFoe`, 0 = off).
+    const _midiRules: any = (() => {
+      try {
+        return (game as any).settings.get('midi-qol', 'ConfigSettings')?.optionalRules || {};
+      } catch (e) {
+        return {};
+      }
+    })();
+    // Per target: Midi-QOL's range verdict (normal / dis / fail) and its range numbers, kept for the roll.
+    const _verdicts = new Map<string, any>();
     // ============ ENGINE RULE GATE: let Foundry/Midi-QOL decide legality ============
     // The DM/LLM cannot bypass rules. Midi's own checkActivityRange enforces the item's range/reach
     // AND any feats/effects that modify it (e.g. Spell Sniper doubling range); canSee enforces line
@@ -2541,16 +2571,25 @@ export class QueryHandlers {
       const _inRange = (tgt: any) => {
         try {
           const rr = _M?.checkActivityRange(activity, attTok.object, new Set([tgt.object]), false);
+          _verdicts.set(tgt.id, rr || null);
           return !rr || rr.result !== 'fail';
         } catch (e) {
+          _verdicts.delete(tgt.id);
           return true;
         }
       };
-      const _dist = (tgt: any) => {
+      // Board #1887: the distance Midi-QOL itself measured for its range check (its wall rule on), so
+      // a refusal reports what the engine measured; negative when a wall blocks the attack.
+      const _measured = (tgt: any) => {
         try {
-          return _M?.computeDistance(attTok.object, tgt.object, { wallsBlock: false });
+          const wallsBlock =
+            (_midiRules.wallsBlockRange ?? 'center') !== 'none' &&
+            !activity?.midiProperties?.ignoreFullCover;
+          const f = typeof _M?.getDistance === 'function' ? _M.getDistance : _M?.computeDistance;
+          const d = f ? f(attTok.object, tgt.object, { wallsBlock, includeCover: true }) : null;
+          return typeof d === 'number' && Number.isFinite(d) ? d : null;
         } catch (e) {
-          return -1;
+          return null;
         }
       };
       const _canSee = (tgt: any) => {
@@ -2615,17 +2654,22 @@ export class QueryHandlers {
               continue;
             }
           } else {
-            const _df = _dist(t);
+            // Board #1887 (KNOWN-ISSUES row 221): say WHY Midi-QOL refused. Its range check fails when
+            // its own distance (walls on) is negative, which means a wall is in the way, or beyond the
+            // long range. The old words gave a no-walls distance and always said "beyond the range".
+            const _df = _measured(t);
+            const _vr = _verdicts.get(t.id) || {};
             results.push({
               target: t.name,
               hit: false,
-              outOfRange: true,
-              note:
-                t.name +
-                ' is ' +
-                (_df >= 0 ? _df + 'ft' : 'too far') +
-                ' away, beyond the range of ' +
-                item.name,
+              ...describeRangeRefusal({
+                targetName: t.name,
+                itemName: item.name,
+                wallBlocked: typeof _df === 'number' && _df < 0,
+                measuredFt: _df,
+                normalFt: _vr.range,
+                longFt: _vr.longRange,
+              }),
             });
             continue;
           }
@@ -2705,27 +2749,104 @@ export class QueryHandlers {
 
     // ---- ATTACK-ROLL actions (weapons + spell attacks): Midi's use() no-ops headless. ----
     if (isAttack) {
+      const _M2: any = (globalThis as any).MidiQOL;
       for (const t of targetToks) {
         const AC = t.actor?.system?.attributes?.ac?.value ?? 10;
         const hpBefore = t.actor?.system?.attributes?.hp?.value ?? 0;
+        // Board #1887 (bridge 0.10.7, KNOWN-ISSUES row 221): the roll follows the range rules.
+        // (1) The attack mode is always passed: thrown for a thrown weapon beyond its reach (the same
+        //     test Midi-QOL's workflow makes), otherwise the weapon's melee mode. dnd5e otherwise
+        //     reuses the mode it remembers from the last attack, so one throw made every later
+        //     attack with that weapon a throw.
+        // (2) Disadvantage from Midi-QOL's own answers: its range verdict `dis` (long range) and, for
+        //     a ranged attack roll, its "nearby foe" check (an enemy within 5 ft who can see you).
+        // (3) A throw uses the weapon up the dnd5e way (quantity - 1); a weapon already used up is
+        //     refused, also between two targets of one call.
+        const _vr: any = _verdicts.get(t.id) || null;
+        const _sys: any = item.system || {};
+        // An unlinked token's actor can hand back a new item object after an update, so the
+        // quantity is read fresh from the actor each time.
+        const _qtyNow = () =>
+          attTok.actor?.items?.get?.(item.id)?.system?.quantity ?? item.system?.quantity;
+        const _thrProp = !!_sys.properties?.has?.('thr');
+        const _modes = ((_sys.attackModes as any[]) || []).map((m: any) => m?.value);
+        let _noWallsFt: number | null = null;
+        try {
+          const f = typeof _M2?.getDistance === 'function' ? _M2.getDistance : _M2?.computeDistance;
+          const d = f ? f(attTok.object, t.object, { wallsBlock: false }) : null;
+          _noWallsFt = typeof d === 'number' && Number.isFinite(d) ? d : null;
+        } catch (e) {
+          _noWallsFt = null;
+        }
+        const _reachFt =
+          Number(_sys.range?.reach) ||
+          Number((globalThis as any).canvas?.dimensions?.distance) ||
+          5;
+        const _choice = chooseAttackMode({
+          modes: _modes,
+          thrownProperty: _thrProp,
+          distanceFt: _noWallsFt,
+          reachFt: _reachFt,
+          verdict: _vr?.result,
+        });
+        if (_choice.thrown && weaponUsedUp({ type: item.type, quantity: _qtyNow() })) {
+          results.push({
+            target: t.name,
+            hit: false,
+            noWeaponLeft: true,
+            note: `${attTok.name} has no ${item.name} left to throw (all of them were used up)`,
+          });
+          continue;
+        }
+        const _rangedRoll =
+          _choice.thrown || ['rwak', 'rsak'].includes(String(activity.actionType || ''));
+        let _foeNearby = false;
+        try {
+          const nf = Number(_midiRules.nearbyFoe) || 0;
+          // Midi-QOL's own opt-out (a feat such as Crossbow Expert sets it): the rule is not applied.
+          const ignoreNearby = !!attTok.actor?.flags?.['midi-qol']?.ignoreNearbyFoes;
+          _foeNearby =
+            _rangedRoll && nf > 0 && !ignoreNearby && typeof _M2?.checkNearby === 'function'
+              ? !!_M2.checkNearby(-1, attTok.object, nf, {
+                  includeIncapacitated: false,
+                  canSee: true,
+                })
+              : false;
+        } catch (e) {
+          _foeNearby = false;
+        }
+        const _adv = rangeRollAdvantage({
+          verdict: _vr?.result,
+          rangedAttack: _rangedRoll,
+          foeNearby: _foeNearby,
+        });
+        const _rollCfg: any = {};
+        if (_choice.mode) _rollCfg.attackMode = _choice.mode;
+        if (_adv.disadvantage) _rollCfg.disadvantage = true;
         t.object?.setTarget(true, { user: (game as any).user, releaseOthers: true });
         let attackTotal: number | null = null,
           crit = false,
           fumble = false,
-          hit = false;
+          hit = false,
+          formula: string | null = null;
         let damage = 0,
           damageType: string | null = null,
           hpAfter = hpBefore,
           error: string | null = null;
         try {
-          const ar = await (activity as any).rollAttack({}, { configure: false }, {});
+          const ar = await (activity as any).rollAttack(_rollCfg, { configure: false }, {});
           const aroll = Array.isArray(ar) ? ar[0] : ar;
           attackTotal = aroll?.total ?? null;
+          formula = aroll?.formula ?? null;
           crit = !!aroll?.isCritical;
           fumble = !!aroll?.isFumble;
           hit = crit || (!fumble && attackTotal != null && attackTotal >= AC);
           if (hit) {
-            const dr = await (activity as any).rollDamage({}, { configure: false }, {});
+            const dr = await (activity as any).rollDamage(
+              _choice.mode ? { attackMode: _choice.mode } : {},
+              { configure: false },
+              {}
+            );
             const rolls = Array.isArray(dr) ? dr : [dr];
             damage = rolls.reduce((s: number, r: any) => s + (r?.total || 0), 0);
             damageType = rolls[0]?.options?.type || rolls[0]?.options?.flavor || 'none';
@@ -2765,6 +2886,15 @@ export class QueryHandlers {
           targetAC: AC,
           via: 'attack',
           error,
+          // Board #1887: how the engine rolled it.
+          formula,
+          attackMode: _choice.mode ?? null,
+          thrown: _choice.thrown,
+          ...(_choice.thrown ? { remaining: _qtyNow() ?? null } : {}),
+          disadvantage: _adv.disadvantage,
+          disadvantageReasons: _adv.reasons,
+          rangeVerdict: _vr?.result ?? null,
+          distanceFt: _noWallsFt,
         });
       }
       await consumeSlot();
