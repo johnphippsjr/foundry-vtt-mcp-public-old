@@ -45,6 +45,8 @@ import {
   isUnarmedStrike,
   unarmedStrikeUuid,
   appliedDamage,
+  pickItemByName,
+  midiIgnoresNearbyFoes,
 } from './attack-rules-utils.js';
 
 // Board #1714 review: adventure-import and adventure-source-backfill apply both plan from live
@@ -2479,6 +2481,7 @@ export class QueryHandlers {
     attacker: string;
     item: string;
     targets: string[];
+    itemId?: string;
   }): Promise<any> {
     const gm = this.validateGMAccess();
     if (!gm.allowed) return { error: 'Access denied', success: false };
@@ -2489,11 +2492,22 @@ export class QueryHandlers {
     if (!attTok) throw new Error('Attacker token not found: ' + data.attacker);
     const actor = attTok.actor;
     if (!actor) throw new Error('Attacker has no actor');
-    const itemLower = String(data.item).toLowerCase();
-    let item =
-      actor.items.find(
-        (i: any) => i.name?.toLowerCase() === itemLower && i.system?.activities?.size
-      ) || actor.items.find((i: any) => i.name?.toLowerCase() === itemLower);
+    // Board #1887 (independent review of 0.10.7, finding 5): a rule the bridge could not apply because Midi-QOL or
+    // dnd5e threw is never dropped quietly. Each such case is said here, and the caller logs it.
+    const ruleWarnings: string[] = [];
+    const warnRule = (what: string, e: any) =>
+      ruleWarnings.push(`${what}: ${String((e && (e.message || e)) || 'unknown error')}`);
+    // Board #1887 (review finding 2): the exact item when the caller names its id (the brain does, from the combat
+    // snapshot); by name, the first stack that can still attack (a used-up Javelin stack next to a new one is skipped).
+    let item: any = null;
+    if (data.itemId) {
+      item = actor.items.get?.(data.itemId) ?? null;
+      if (!item)
+        ruleWarnings.push(
+          `no item with id ${data.itemId} on ${attTok.name}: the item was looked up by its name, ${data.item}`
+        );
+    }
+    if (!item) item = pickItemByName(actor.items, String(data.item));
     // Board #1887 (operator decision 2026-09-27 "Unarmed Strike"): every creature can make an Unarmed Strike, but a
     // monster's stat block never carries the item. When the attacker has none of its own, the attack uses dnd5e's
     // OWN Unarmed Strike (its compendium item for the world's rules version) as a temporary copy owned by the
@@ -2509,6 +2523,14 @@ export class QueryHandlers {
       unarmed = true;
     }
     if (!item) throw new Error('Item not found on attacker: ' + data.item);
+    // Board #1887 (review findings 2 and 5): every answer names the attacker's token and the exact item used (so the
+    // brain records a character's throw against that stack), and carries any rule the engine could not apply.
+    const finish = (o: any) => ({
+      ...o,
+      attackerId: attTok.id,
+      itemId: unarmed ? null : (item.id ?? null),
+      ...(ruleWarnings.length ? { ruleWarnings: [...ruleWarnings] } : {}),
+    });
     const activities = [...((item.system.activities as any) || [])];
     const activity = activities.find((a: any) => a.type === 'attack') || activities[0];
     if (!activity) throw new Error('No usable activity on item: ' + data.item);
@@ -2519,12 +2541,12 @@ export class QueryHandlers {
     if (spellLevel > 0) {
       const slot = actor.system.spells?.['spell' + spellLevel];
       if (!slot || (slot.value || 0) <= 0)
-        return {
+        return finish({
           success: false,
           error: 'No level-' + spellLevel + ' spell slots remaining',
           attacker: attTok.name,
           item: item.name,
-        };
+        });
     }
     const consumeSlot = async () => {
       if (spellLevel > 0) {
@@ -2560,7 +2582,13 @@ export class QueryHandlers {
           noWeaponLeft: true,
           note: `${attTok.name} has no ${item.name} left to attack with (all of them were used up)`,
         });
-      return { success: false, attacker: attTok.name, item: item.name, results, refused: true };
+      return finish({
+        success: false,
+        attacker: attTok.name,
+        item: item.name,
+        results,
+        refused: true,
+      });
     }
     // Midi-QOL's own settings, read once: its wall rule for range (`wallsBlockRange`) and its
     // "nearby foe" distance for ranged attacks in close combat (`nearbyFoe`, 0 = off).
@@ -2568,6 +2596,10 @@ export class QueryHandlers {
       try {
         return (game as any).settings.get('midi-qol', 'ConfigSettings')?.optionalRules || {};
       } catch (e) {
+        warnRule(
+          "Midi-QOL's settings could not be read, so its wall rule for range and its close-combat rule used their defaults",
+          e
+        );
         return {};
       }
     })();
@@ -2592,6 +2624,10 @@ export class QueryHandlers {
           return !rr || rr.result !== 'fail';
         } catch (e) {
           _verdicts.delete(tgt.id);
+          warnRule(
+            `Midi-QOL's range check failed for ${tgt.name}, so the attack was allowed with no range rule (no long-range disadvantage)`,
+            e
+          );
           return true;
         }
       };
@@ -2606,6 +2642,10 @@ export class QueryHandlers {
           const d = f ? f(attTok.object, tgt.object, { wallsBlock, includeCover: true }) : null;
           return typeof d === 'number' && Number.isFinite(d) ? d : null;
         } catch (e) {
+          warnRule(
+            `Midi-QOL's distance to ${tgt.name} (walls on) could not be measured, so the refusal gives no distance`,
+            e
+          );
           return null;
         }
       };
@@ -2613,6 +2653,10 @@ export class QueryHandlers {
         try {
           return _M?.canSee ? _M.canSee(attTok.object, tgt.object) : true;
         } catch (e) {
+          warnRule(
+            `Midi-QOL's sight check for ${tgt.name} failed, so the attack was allowed as if it could see`,
+            e
+          );
           return true;
         }
       };
@@ -2696,7 +2740,13 @@ export class QueryHandlers {
       targetToks = _valid;
     }
     if (!targetToks.length)
-      return { success: false, attacker: attTok.name, item: item.name, results, refused: true };
+      return finish({
+        success: false,
+        attacker: attTok.name,
+        item: item.name,
+        results,
+        refused: true,
+      });
     const targetObjs = targetToks.map((t: any) => t.object).filter(Boolean);
     attTok.object?.control({ releaseOthers: true });
 
@@ -2733,7 +2783,7 @@ export class QueryHandlers {
         });
       }
       await consumeSlot();
-      return { success: true, attacker: attTok.name, item: item.name, results };
+      return finish({ success: true, attacker: attTok.name, item: item.name, results });
     }
 
     // ---- BUFF / UTILITY (Bless, etc.): apply the spell's active effect(s) to the targets. ----
@@ -2761,7 +2811,7 @@ export class QueryHandlers {
         results.push({ target: t.name, effectsApplied: applied, via: 'buff' });
       }
       await consumeSlot();
-      return { success: true, attacker: attTok.name, item: item.name, results };
+      return finish({ success: true, attacker: attTok.name, item: item.name, results });
     }
 
     // ---- ATTACK-ROLL actions (weapons + spell attacks): Midi's use() no-ops headless. ----
@@ -2794,6 +2844,10 @@ export class QueryHandlers {
           _noWallsFt = typeof d === 'number' && Number.isFinite(d) ? d : null;
         } catch (e) {
           _noWallsFt = null;
+          warnRule(
+            `Midi-QOL's distance to ${t.name} (walls off) could not be measured, so the throw-or-melee choice fell back to its range verdict`,
+            e
+          );
         }
         const _reachFt =
           Number(_sys.range?.reach) ||
@@ -2818,19 +2872,33 @@ export class QueryHandlers {
         const _rangedRoll =
           _choice.thrown || ['rwak', 'rsak'].includes(String(activity.actionType || ''));
         let _foeNearby = false;
-        try {
-          const nf = Number(_midiRules.nearbyFoe) || 0;
-          // Midi-QOL's own opt-out (a feat such as Crossbow Expert sets it): the rule is not applied.
-          const ignoreNearby = !!attTok.actor?.flags?.['midi-qol']?.ignoreNearbyFoes;
-          _foeNearby =
-            _rangedRoll && nf > 0 && !ignoreNearby && typeof _M2?.checkNearby === 'function'
-              ? !!_M2.checkNearby(-1, attTok.object, nf, {
+        const nf = Number(_midiRules.nearbyFoe) || 0;
+        if (_rangedRoll && nf > 0) {
+          // Midi-QOL's own opt-out (a feat such as Crossbow Expert sets it) is a CONDITION, evaluated the way Midi's
+          // workflow does (evalAllConditions over the actor's effects and flag, with Midi's condition data); board
+          // #1887 review finding 5: a plain truthiness test took a condition that evaluates false as "ignore".
+          const ignoreNearby = midiIgnoresNearbyFoes(_M2, attTok, t, activity, item, warnRule);
+          if (!ignoreNearby) {
+            if (typeof _M2?.checkNearby !== 'function') {
+              warnRule(
+                "Midi-QOL's close-combat check (checkNearby) is not available, so no close-combat disadvantage was applied",
+                'not available'
+              );
+            } else {
+              try {
+                _foeNearby = !!_M2.checkNearby(-1, attTok.object, nf, {
                   includeIncapacitated: false,
                   canSee: true,
-                })
-              : false;
-        } catch (e) {
-          _foeNearby = false;
+                });
+              } catch (e) {
+                _foeNearby = false;
+                warnRule(
+                  `Midi-QOL's close-combat check failed for the attack on ${t.name}, so no close-combat disadvantage was applied`,
+                  e
+                );
+              }
+            }
+          }
         }
         const _adv = rangeRollAdvantage({
           verdict: _vr?.result,
@@ -2929,7 +2997,7 @@ export class QueryHandlers {
         });
       }
       await consumeSlot();
-      return { success: true, attacker: attTok.name, item: item.name, results };
+      return finish({ success: true, attacker: attTok.name, item: item.name, results });
     }
 
     // ---- SAVE / other (Sacred Flame, Fireball): Midi resolves the save + half/none damage. ----
@@ -2976,7 +3044,7 @@ export class QueryHandlers {
       });
     }
     await consumeSlot();
-    return { success: true, attacker: attTok.name, item: item.name, results };
+    return finish({ success: true, attacker: attTok.name, item: item.name, results });
   }
 
   /**

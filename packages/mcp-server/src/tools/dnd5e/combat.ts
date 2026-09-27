@@ -25,12 +25,18 @@ export class CombatTools {
   }
 
   async handleDiagEval(args: { js: string }) {
-    return this.wrap(await this.foundryClient.query('foundry-mcp-bridge.diagEval', { js: args?.js }));
+    return this.wrap(
+      await this.foundryClient.query('foundry-mcp-bridge.diagEval', { js: args?.js })
+    );
   }
 
   getToolDefinitions() {
     return [
-      { name: 'diag-eval', description: 'INTERNAL diagnostic: run JS in the GM browser and return the JSON result.', inputSchema: { type: 'object', properties: { js: { type: 'string' } }, required: ['js'] } },
+      {
+        name: 'diag-eval',
+        description: 'INTERNAL diagnostic: run JS in the GM browser and return the JSON result.',
+        inputSchema: { type: 'object', properties: { js: { type: 'string' } }, required: ['js'] },
+      },
       {
         name: 'start-combat',
         description:
@@ -41,7 +47,8 @@ export class CombatTools {
             tokens: {
               type: 'array',
               items: { type: 'string' },
-              description: 'Token names or ids to add to combat. Omit to use the automatic party-plus-nearby-hostiles scope.',
+              description:
+                'Token names or ids to add to combat. Omit to use the automatic party-plus-nearby-hostiles scope.',
             },
             party: {
               type: 'array',
@@ -65,18 +72,29 @@ export class CombatTools {
       {
         name: 'get-combat-state',
         description:
-          'Get the current combat state: round, whose turn it is, and the initiative order with each combatant\'s HP.',
+          "Get the current combat state: round, whose turn it is, and the initiative order with each combatant's HP.",
         inputSchema: { type: 'object', properties: {} },
       },
       {
         name: 'execute-attack',
         description:
-          'Resolve an attack. The Foundry engine (Midi-QOL) rolls the attack vs the target\'s AC, rolls damage on a hit, and applies it automatically. Provide the attacker token (name or id), the weapon/attack item name on that attacker, and the target token(s) (name or id). Returns the damage applied and each target\'s HP before/after.',
+          "Resolve an attack. The Foundry engine (Midi-QOL) rolls the attack vs the target's AC, rolls damage on a hit, and applies it automatically. Provide the attacker token (name or id), the weapon/attack item name on that attacker, and the target token(s) (name or id). Returns the damage applied and each target's HP before/after.",
         inputSchema: {
           type: 'object',
           properties: {
-            attacker: { type: 'string', description: 'Attacker token name or id on the active scene.' },
-            item: { type: 'string', description: 'Name of the weapon/attack item on the attacker (e.g. "Scimitar").' },
+            attacker: {
+              type: 'string',
+              description: 'Attacker token name or id on the active scene.',
+            },
+            item: {
+              type: 'string',
+              description: 'Name of the weapon/attack item on the attacker (e.g. "Scimitar").',
+            },
+            itemId: {
+              type: 'string',
+              description:
+                'Optional: the id of the exact item to use when the attacker holds several items with that name (e.g. an empty Javelin stack and a full one).',
+            },
             targets: {
               type: 'array',
               items: { type: 'string' },
@@ -112,6 +130,7 @@ export class CombatTools {
         attacker: args?.attacker,
         item: args?.item,
         targets: args?.targets || [],
+        ...(args?.itemId ? { itemId: args.itemId } : {}),
       })
     );
   }

@@ -10,6 +10,7 @@ import {
   unarmedStrikeUuid,
   appliedDamage,
   UNARMED_STRIKE_UUID,
+  pickItemByName,
 } from './attack-rules-utils.js';
 
 const DAGGER = ['oneHanded', 'offhand', null, 'thrown', 'thrown-offhand'];
@@ -192,5 +193,40 @@ describe('appliedDamage: below 0 deals 0, per damage type (dnd5e 5.3.3 chat-card
   });
   it('nothing rolled is 0', () => {
     expect(appliedDamage([])).toBe(0);
+  });
+});
+
+// Board #1887, independent review of bridge 0.10.7, finding 2: which stack an attack by name means.
+describe('pickItemByName', () => {
+  const stack = (id: string, quantity: number, activities = 1, type = 'weapon') => ({
+    id,
+    name: 'Javelin',
+    type,
+    system: { quantity, activities: { size: activities } },
+  });
+
+  it('skips a used-up stack for one that can still attack', () => {
+    expect(pickItemByName([stack('a', 0), stack('b', 2)], 'javelin')?.id).toBe('b');
+  });
+
+  it('all stacks used up: the first that can attack (execute-attack then refuses it, as before)', () => {
+    expect(pickItemByName([stack('a', 0, 0), stack('b', 0), stack('c', 0)], 'Javelin')?.id).toBe(
+      'b'
+    );
+  });
+
+  it('nothing can attack: the first match; nothing matches: null', () => {
+    expect(pickItemByName([stack('a', 1, 0)], 'Javelin')?.id).toBe('a');
+    expect(pickItemByName([stack('a', 1)], 'Spear')).toBeNull();
+  });
+
+  it('a non-weapon with no quantity is never "used up" (a spell, say)', () => {
+    const spell = {
+      id: 's',
+      name: 'Fire Bolt',
+      type: 'spell',
+      system: { activities: { size: 1 } },
+    };
+    expect(pickItemByName([spell], 'fire bolt')?.id).toBe('s');
   });
 });

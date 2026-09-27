@@ -120,6 +120,101 @@ export function weaponUsedUp(item: { type?: string; quantity?: unknown }): boole
   return item?.type === 'weapon' && typeof item.quantity === 'number' && item.quantity <= 0;
 }
 
+/** Midi-QOL's own flag for "this attacker ignores the close-combat rule" (Crossbow Expert and the like). */
+export const MIDI_IGNORE_NEARBY_FOES = 'flags.midi-qol.ignoreNearbyFoes';
+
+/**
+ * Does Midi-QOL's own `ignoreNearbyFoes` opt-out apply to this attack? (board #1887, independent review of bridge
+ * 0.10.7, finding 5.) In Midi-QOL the flag is a CONDITION, not a plain on/off: its workflow evaluates it with
+ * `evalAllConditionsAsync(actor, 'flags.midi-qol.ignoreNearbyFoes', createConditionData({workflow, target, actor}))`
+ * (Workflow.ts, 14.0.12), which evaluates each applied effect's change with that key, or the actor's own flag, as a
+ * condition expression. 0.10.7 as first built took any value that is set (even one that evaluates false) as "ignore".
+ * Here the flag is evaluated with Midi-QOL's own public `evalAllConditions` and `createConditionData` (the synchronous
+ * twins of what its workflow uses). With no flag and no such effect, the answer is false and nothing is evaluated.
+ * When Midi cannot evaluate it (the function is missing or throws), `warn` is told and the flag counts as set, as
+ * before. Midi and the tokens are passed in, so no Foundry global is touched here.
+ */
+export function midiIgnoresNearbyFoes(
+  midi: any,
+  attackerToken: any,
+  targetToken: any,
+  activity: any,
+  item: any,
+  warn: (what: string, e: any) => void
+): boolean {
+  const actor = attackerToken?.actor;
+  if (!actor) return false;
+  let effects: any[] = [];
+  try {
+    effects = [...(actor.appliedEffects ?? [])].filter((ef: any) =>
+      (ef?.system?.changes ?? ef?.changes ?? []).some(
+        (c: any) => c?.key === MIDI_IGNORE_NEARBY_FOES
+      )
+    );
+  } catch (e) {
+    effects = [];
+  }
+  const plain = actor.flags?.['midi-qol']?.ignoreNearbyFoes;
+  const plainSet = !(plain === undefined || plain === null || plain === '' || plain === false);
+  if (!effects.length && !plainSet) return false;
+  const fallback = plainSet || effects.length > 0;
+  if (typeof midi?.evalAllConditions !== 'function') {
+    warn(
+      "Midi-QOL's condition evaluator (evalAllConditions) is not available, so the attacker's ignoreNearbyFoes flag was taken as set",
+      'not available'
+    );
+    return fallback;
+  }
+  try {
+    const data =
+      typeof midi.createConditionData === 'function'
+        ? midi.createConditionData({
+            actor,
+            target: targetToken?.object ?? targetToken,
+            activity,
+            item,
+          })
+        : {};
+    return !!midi.evalAllConditions(actor, MIDI_IGNORE_NEARBY_FOES, data);
+  } catch (e) {
+    warn(
+      "Midi-QOL could not evaluate the attacker's ignoreNearbyFoes condition, so it was taken as set",
+      e
+    );
+    return fallback;
+  }
+}
+
+export interface NamedItemLike {
+  name?: string | null;
+  type?: string;
+  system?: { quantity?: unknown; activities?: { size?: number } | null } | null;
+}
+
+/**
+ * Which of an actor's items an attack by NAME means (board #1887, independent review of bridge 0.10.7, finding 2).
+ * An actor can hold several stacks with one name: a character who threw every Javelin of one stack (quantity 0, the
+ * item is kept, dnd5e's way) and then picked up a new stack of Javelins. Taking the first name match refused the
+ * attack ("has no Javelin left") while the new stack sat in the pack. Among the items whose name matches (ignoring
+ * case), the first one that can attack and is not used up; else the first that can attack; else the first match;
+ * null when nothing has the name.
+ */
+export function pickItemByName<T extends NamedItemLike>(
+  items: Iterable<T>,
+  name: string
+): T | null {
+  const want = String(name ?? '').toLowerCase();
+  const matches = [...items].filter(i => (i?.name ?? '').toLowerCase() === want);
+  const canAttack = (i: T) => !!i?.system?.activities?.size;
+  const notUsedUp = (i: T) => !weaponUsedUp({ type: i?.type ?? '', quantity: i?.system?.quantity });
+  return (
+    matches.find(i => canAttack(i) && notUsedUp(i)) ??
+    matches.find(i => canAttack(i)) ??
+    matches[0] ??
+    null
+  );
+}
+
 /**
  * dnd5e 5.3.3's OWN Unarmed Strike items, in the compendia the system ships (board #1887, operator decision
  * 2026-09-27 "Unarmed Strike": a monster with no weapon left makes an Unarmed Strike).

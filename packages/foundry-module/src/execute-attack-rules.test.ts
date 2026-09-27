@@ -85,9 +85,10 @@ function makeWeapon(opts: {
   actionType?: string;
   type?: string;
   remembered?: string;
+  id?: string;
 }) {
   const item: any = {
-    id: `item${opts.name.replace(/\W/g, '')}`,
+    id: opts.id ?? `item${opts.name.replace(/\W/g, '')}`,
     name: opts.name,
     type: opts.type ?? 'weapon',
     flags: {},
@@ -214,6 +215,10 @@ let tokens: ValueCollection<any>;
 let walls: Set<string>; // "idA|idB" pairs a wall stands between (either order)
 let wallsOnFt: Map<string, number>; // a walls-on distance that differs from the open measure
 let midiRules: any;
+// Board #1887 review finding 5: which Midi-QOL calls the stand-in makes throw, and whether its condition evaluator
+// is missing.
+let midiThrows: Record<string, boolean> = {};
+let midiNoEvaluator = false;
 
 function key(a: any, b: any) {
   return [a.id, b.id].sort().join('|');
@@ -256,7 +261,10 @@ function install(toks: Tok[]) {
     scenes: { active: scene, contents: [scene] },
     settings: {
       get(scope: string, name: string) {
-        if (scope === 'midi-qol' && name === 'ConfigSettings') return { optionalRules: midiRules };
+        if (scope === 'midi-qol' && name === 'ConfigSettings') {
+          if (midiThrows.settings) throw new Error('settings exploded');
+          return { optionalRules: midiRules };
+        }
         throw new Error(`unknown setting ${scope}.${name}`);
       },
     },
@@ -270,12 +278,36 @@ function install(toks: Tok[]) {
     if (opts.wallsBlock && wallsOnFt.has(key(A, B))) return wallsOnFt.get(key(A, B))!;
     return openFeet(A, B);
   };
+  const maybeThrow = (what: string) => {
+    if (midiThrows[what]) throw new Error(`${what} exploded`);
+  };
   g.MidiQOL = {
-    getDistance: distance,
+    getDistance: (a: any, b: any, opts: any = {}) => {
+      maybeThrow(opts.wallsBlock ? 'distanceWallsOn' : 'distanceWallsOff');
+      return distance(a, b, opts);
+    },
     computeDistance: distance,
-    canSee: () => true,
+    canSee: () => {
+      maybeThrow('canSee');
+      return true;
+    },
+    // Midi-QOL 14.0.12 evalAllConditions / createConditionData, reduced: the actor's own flag is a condition
+    // expression, evaluated (here with plain JavaScript) to a truthy or falsy answer.
+    ...(midiNoEvaluator
+      ? {}
+      : {
+          createConditionData: (d: any) => ({ actorName: d?.actor?.name, target: d?.target }),
+          evalAllConditions: (actor: any, flag: string) => {
+            maybeThrow('evalAllConditions');
+            const v = getProperty(actor, flag);
+            if (v === undefined || v === null || v === '') return false;
+            if (typeof v === 'boolean') return v;
+            return !!new Function(`return (${String(v)});`)();
+          },
+        }),
     // Midi-QOL 14.0.12 checkRangeFunction, reduced (checkRange 'longFail').
     checkActivityRange(activity: any, tokenObj: any, targets: Set<any>) {
+      maybeThrow('checkActivityRange');
       const rng = activity.item.system.range || {};
       let range = Number(rng.value) || Number(rng.reach) || 0;
       let longRange = Number(rng.long) || 0;
@@ -302,6 +334,7 @@ function install(toks: Tok[]) {
     // Midi-QOL findNearby/checkNearby, reduced: a token of the opposite disposition within
     // `dist` feet (walls on) that can see the attacker.
     checkNearby(disposition: number, tokenObj: any, dist: number, opts: any = {}) {
+      maybeThrow('checkNearby');
       const me = docOf(tokenObj);
       const want = me.disposition * disposition;
       return tokens.contents.some(
@@ -341,9 +374,14 @@ function world(opts: {
   return { dagger, kobold, brakka };
 }
 
-async function attack(item = 'Dagger', targets = ['brakka']) {
+async function attack(item = 'Dagger', targets = ['brakka'], itemId?: string) {
   const h = new QueryHandlers() as any;
-  return h.handleExecuteAttack({ attacker: 'kobold', item, targets });
+  return h.handleExecuteAttack({
+    attacker: 'kobold',
+    item,
+    targets,
+    ...(itemId ? { itemId } : {}),
+  });
 }
 
 beforeEach(() => {
@@ -354,6 +392,8 @@ beforeEach(() => {
   walls = new Set();
   wallsOnFt = new Map();
   midiRules = { wallsBlockRange: 'center', nearbyFoe: 5, checkRange: 'longFail' };
+  midiThrows = {};
+  midiNoEvaluator = false;
 });
 
 describe('FS-07: a Dagger kobold at 10, 45 and 70 ft', () => {
@@ -788,5 +828,177 @@ describe("damage below 0 deals 0 for every weapon (dnd5e's own rule when it appl
     expect(res.results[0].hit).toBe(true);
     expect(res.results[0].damageApplied).toBe(0);
     expect(brakka.system.attributes.hp.value).toBe(20);
+  });
+});
+
+// ================================================================================================
+// Board #1887, independent review of bridge 0.10.7 (dfd2d515 + 6d6441be + fork 63d553c), findings 2 and 5.
+// ================================================================================================
+function javelin(id: string, quantity: number) {
+  return makeWeapon({
+    id,
+    name: 'Javelin',
+    quantity,
+    range: { value: 30, long: 120, reach: 5 },
+    properties: ['thr'],
+    attackModes: [{ value: 'oneHanded' }, { rule: true }, { value: 'thrown' }],
+  });
+}
+
+const orenNextToTheThrower = () => ({
+  id: 'oren',
+  name: 'Oren',
+  sq: 0,
+  sy: 1,
+  disposition: 1,
+  actor: makeActor('Oren', []),
+});
+
+describe('finding 2: which item an attack by name means', () => {
+  it('an empty Javelin stack next to a new one: the new stack is thrown, not refused', async () => {
+    const empty = javelin('jvEmpty000000000', 0);
+    const fresh = javelin('jvFresh000000000', 3);
+    world({ targetFeet: 20, attackerItems: [empty, fresh] });
+    const res = await attack('Javelin');
+    expect(res.refused).toBeUndefined();
+    expect(res.success).toBe(true);
+    expect(res.itemId).toBe('jvFresh000000000');
+    expect(fresh.system.quantity).toBe(2);
+    expect(empty.system.quantity).toBe(0);
+  });
+
+  it('the caller names the exact stack by id: that one is used', async () => {
+    const a = javelin('jvA0000000000000', 2);
+    const b = javelin('jvB0000000000000', 2);
+    world({ targetFeet: 20, attackerItems: [a, b] });
+    const res = await attack('Javelin', ['brakka'], 'jvB0000000000000');
+    expect(res.itemId).toBe('jvB0000000000000');
+    expect(b.system.quantity).toBe(1);
+    expect(a.system.quantity).toBe(2);
+    expect(res.ruleWarnings).toBeUndefined();
+  });
+
+  it('an id the attacker does not hold: looked up by name, and the answer says so', async () => {
+    const a = javelin('jvA0000000000000', 2);
+    world({ targetFeet: 20, attackerItems: [a] });
+    const res = await attack('Javelin', ['brakka'], 'nope000000000000');
+    expect(res.itemId).toBe('jvA0000000000000');
+    expect(res.ruleWarnings?.[0]).toMatch(/no item with id nope000000000000/);
+  });
+
+  it("every answer names the attacker's token and the item used (a refusal too)", async () => {
+    world({ targetFeet: 70 });
+    const res = await attack();
+    expect(res.refused).toBe(true);
+    expect(res.attackerId).toBe('kobold');
+    expect(res.itemId).toBe('itemDagger');
+  });
+});
+
+describe('finding 5: a rule the engine could not apply is reported, never dropped quietly', () => {
+  it("Midi-QOL's settings cannot be read: the attack goes on and the answer says the defaults were used", async () => {
+    midiThrows.settings = true;
+    world({ targetFeet: 10 });
+    const res = await attack();
+    expect(res.success).toBe(true);
+    expect(res.ruleWarnings?.join(' ')).toMatch(/settings could not be read/);
+  });
+
+  it('the close-combat check throws: reported (it used to drop the disadvantage silently)', async () => {
+    midiThrows.checkNearby = true;
+    world({ targetFeet: 15, extraTokens: [orenNextToTheThrower()] });
+    const res = await attack();
+    expect(rollCalls[0].config).toEqual({ attackMode: 'thrown' });
+    expect(res.ruleWarnings?.join(' ')).toMatch(/close-combat check failed/);
+  });
+
+  it('the range check throws: reported (no long-range disadvantage could be applied)', async () => {
+    midiThrows.checkActivityRange = true;
+    world({ targetFeet: 45 });
+    const res = await attack();
+    expect(res.ruleWarnings?.join(' ')).toMatch(/range check failed for Brakka/);
+  });
+
+  it('the walls-off distance throws: reported', async () => {
+    midiThrows.distanceWallsOff = true;
+    world({ targetFeet: 10 });
+    const res = await attack();
+    expect(res.ruleWarnings?.join(' ')).toMatch(/walls off\) could not be measured/);
+  });
+
+  it('the walls-on distance throws while refusing: reported, and the refusal gives no distance', async () => {
+    midiThrows.distanceWallsOn = true;
+    world({ targetFeet: 70 });
+    const res = await attack();
+    expect(res.refused).toBe(true);
+    expect(res.results[0].distanceFt).toBeUndefined();
+    expect(res.ruleWarnings?.join(' ')).toMatch(/walls on\) could not be measured/);
+  });
+
+  it('the sight check throws: reported', async () => {
+    midiThrows.canSee = true;
+    world({ targetFeet: 10 });
+    const res = await attack();
+    expect(res.ruleWarnings?.join(' ')).toMatch(/sight check for Brakka failed/);
+  });
+
+  it('guard: a normal attack carries no warnings at all', async () => {
+    world({ targetFeet: 10 });
+    const res = await attack();
+    expect(res.ruleWarnings).toBeUndefined();
+  });
+});
+
+describe("finding 5: Midi-QOL's ignoreNearbyFoes is a condition, evaluated the way Midi does", () => {
+  it('a condition that evaluates FALSE does not switch the rule off: disadvantage applies', async () => {
+    const dagger = makeDagger(1);
+    world({
+      targetFeet: 15,
+      dagger,
+      attackerItems: [dagger],
+      attackerFlags: { 'midi-qol': { ignoreNearbyFoes: 'false' } },
+      extraTokens: [orenNextToTheThrower()],
+    });
+    const res = await attack();
+    expect(rollCalls[0].config).toEqual({ attackMode: 'thrown', disadvantage: true });
+    expect(res.ruleWarnings).toBeUndefined();
+  });
+
+  it("Midi's evaluator is missing: the flag counts as set, and the answer says it could not be evaluated", async () => {
+    midiNoEvaluator = true;
+    const dagger = makeDagger(1);
+    world({
+      targetFeet: 15,
+      dagger,
+      attackerItems: [dagger],
+      attackerFlags: { 'midi-qol': { ignoreNearbyFoes: 'false' } },
+      extraTokens: [orenNextToTheThrower()],
+    });
+    const res = await attack();
+    expect(rollCalls[0].config).toEqual({ attackMode: 'thrown' });
+    expect(res.ruleWarnings?.join(' ')).toMatch(/evaluator \(evalAllConditions\) is not available/);
+  });
+
+  it('the evaluator throws: the flag counts as set, and the answer says so', async () => {
+    midiThrows.evalAllConditions = true;
+    const dagger = makeDagger(1);
+    world({
+      targetFeet: 15,
+      dagger,
+      attackerItems: [dagger],
+      attackerFlags: { 'midi-qol': { ignoreNearbyFoes: 'true' } },
+      extraTokens: [orenNextToTheThrower()],
+    });
+    const res = await attack();
+    expect(rollCalls[0].config).toEqual({ attackMode: 'thrown' });
+    expect(res.ruleWarnings?.join(' ')).toMatch(/could not evaluate/);
+  });
+
+  it('guard: no flag at all, nothing is evaluated and nothing is reported', async () => {
+    midiNoEvaluator = true;
+    world({ targetFeet: 15, extraTokens: [orenNextToTheThrower()] });
+    const res = await attack();
+    expect(rollCalls[0].config).toEqual({ attackMode: 'thrown', disadvantage: true });
+    expect(res.ruleWarnings).toBeUndefined();
   });
 });
