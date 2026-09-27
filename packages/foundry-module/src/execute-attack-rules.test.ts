@@ -1002,3 +1002,49 @@ describe("finding 5: Midi-QOL's ignoreNearbyFoes is a condition, evaluated the w
     expect(res.ruleWarnings).toBeUndefined();
   });
 });
+
+// ================================================================================================
+// Board #1887, re-review of fork 876a95d (HOLD): the brain gives a character back what it threw after a fight, so the
+// answer must say how many the roll REALLY used up (quantity before minus after), not "the mode was thrown".
+// ================================================================================================
+describe('usedUp: how many the roll really used up', () => {
+  it('a normal throw uses one up', async () => {
+    const dagger = makeDagger(2);
+    world({ targetFeet: 10, dagger, attackerItems: [dagger] });
+    const res = await attack();
+    expect(res.results[0].thrown).toBe(true);
+    expect(res.results[0].usedUp).toBe(1);
+    expect(dagger.system.quantity).toBe(1);
+  });
+
+  it('a Returning weapon is thrown three times and nothing is used up (the reviewer case: 1 came back as 4)', async () => {
+    const dagger = makeDagger(1, { properties: ['thr', 'ret'] });
+    world({ targetFeet: 10, dagger, attackerItems: [dagger] });
+    for (let i = 0; i < 3; i++) {
+      const res = await attack();
+      expect(res.results[0].thrown).toBe(true);
+      expect(res.results[0].usedUp).toBe(0);
+    }
+    expect(dagger.system.quantity).toBe(1);
+  });
+
+  it('a roll that failed uses nothing up, and says why', async () => {
+    const dagger = makeDagger(1);
+    world({ targetFeet: 10, dagger, attackerItems: [dagger] });
+    dagger.system.activities.contents[0].rollAttack = async () => {
+      throw new Error('the roll dialog was closed');
+    };
+    const res = await attack();
+    expect(res.results[0].thrown).toBe(true);
+    expect(res.results[0].usedUp).toBe(0);
+    expect(res.results[0].error).toMatch(/dialog was closed/);
+    expect(dagger.system.quantity).toBe(1);
+  });
+
+  it('a melee stab uses nothing up', async () => {
+    world({ targetFeet: 5 });
+    const res = await attack();
+    expect(res.results[0].thrown).toBe(false);
+    expect(res.results[0].usedUp).toBe(0);
+  });
+});

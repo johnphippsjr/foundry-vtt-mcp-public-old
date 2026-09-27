@@ -47,6 +47,7 @@ import {
   appliedDamage,
   pickItemByName,
   midiIgnoresNearbyFoes,
+  usedUpCount,
 } from './attack-rules-utils.js';
 
 // Board #1714 review: adventure-import and adventure-source-backfill apply both plan from live
@@ -2919,6 +2920,10 @@ export class QueryHandlers {
           damageType: string | null = null,
           hpAfter = hpBefore,
           error: string | null = null;
+        // Board #1887 (re-review of 876a95d): how many the roll REALLY used up, read from the item before and after,
+        // not guessed from the mode: a Returning weapon is thrown but dnd5e keeps its quantity, and a roll that failed
+        // uses nothing up. The brain gives a character back exactly this number after the fight.
+        const _qtyBefore = _qtyNow();
         try {
           const ar = await (activity as any).rollAttack(_rollCfg, { configure: false }, {});
           const aroll = Array.isArray(ar) ? ar[0] : ar;
@@ -2969,6 +2974,7 @@ export class QueryHandlers {
         } catch (e: any) {
           error = String((e && (e.stack || e.message)) || e);
         }
+        const _usedUp = usedUpCount(item.type, _qtyBefore, _qtyNow());
         results.push({
           target: t.name,
           hpBefore,
@@ -2989,6 +2995,7 @@ export class QueryHandlers {
           attackMode: _choice.mode ?? null,
           thrown: _choice.thrown,
           ...(_choice.thrown ? { remaining: _qtyNow() ?? null } : {}),
+          usedUp: _usedUp,
           disadvantage: _adv.disadvantage,
           disadvantageReasons: _adv.reasons,
           rangeVerdict: _vr?.result ?? null,

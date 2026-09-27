@@ -185,6 +185,20 @@ export function midiIgnoresNearbyFoes(
   }
 }
 
+/**
+ * How many of a weapon one attack REALLY used up (board #1887, re-review of fork 876a95d): the item's quantity read
+ * before the roll minus after it, never below 0. dnd5e 5.3.3 takes one off a thrown weapon's quantity unless it has the
+ * Returning property (`AttackActivity#rollAttack`), and a roll that failed takes nothing, so "the mode was thrown" is
+ * not "one was used up" (the reviewer's probe: a Javelin of Returning thrown three times came back 1 -> 4 after the
+ * fight). null when the item is not a weapon or a quantity could not be read.
+ */
+export function usedUpCount(itemType: unknown, before: unknown, after: unknown): number | null {
+  if (itemType !== 'weapon') return null;
+  if (typeof before !== 'number' || typeof after !== 'number') return null;
+  if (!Number.isFinite(before) || !Number.isFinite(after)) return null;
+  return Math.max(0, before - after);
+}
+
 export interface NamedItemLike {
   name?: string | null;
   type?: string;

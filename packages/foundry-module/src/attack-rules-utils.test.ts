@@ -11,6 +11,7 @@ import {
   appliedDamage,
   UNARMED_STRIKE_UUID,
   pickItemByName,
+  usedUpCount,
 } from './attack-rules-utils.js';
 
 const DAGGER = ['oneHanded', 'offhand', null, 'thrown', 'thrown-offhand'];
@@ -228,5 +229,20 @@ describe('pickItemByName', () => {
       system: { activities: { size: 1 } },
     };
     expect(pickItemByName([spell], 'fire bolt')?.id).toBe('s');
+  });
+});
+
+// Board #1887, re-review of fork 876a95d: the count the brain gives back after a fight.
+describe('usedUpCount', () => {
+  it('before minus after, never below 0', () => {
+    expect(usedUpCount('weapon', 3, 2)).toBe(1);
+    expect(usedUpCount('weapon', 1, 1)).toBe(0);
+    expect(usedUpCount('weapon', 1, 3)).toBe(0);
+  });
+
+  it('null when it is not a weapon or a quantity is unknown', () => {
+    expect(usedUpCount('spell', 1, 0)).toBeNull();
+    expect(usedUpCount('weapon', undefined, 0)).toBeNull();
+    expect(usedUpCount('weapon', 1, Number.NaN)).toBeNull();
   });
 });
