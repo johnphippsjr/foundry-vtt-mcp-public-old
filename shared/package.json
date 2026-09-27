@@ -1,6 +1,6 @@
 {
   "name": "@foundry-mcp/shared",
-  "version": "0.10.7",
+  "version": "0.10.8",
   "description": "Shared TypeScript types and constants for Foundry MCP Integration",
   "type": "module",
   "main": "dist/index.js",
