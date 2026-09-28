@@ -559,8 +559,13 @@ export const MIDI_MIN_RUN_MS = 3000;
  * target, one attack each, as before. Measured on the test stack 2026-09-27 before this fix: Guiding Bolt at two
  * targets through one workflow per target spent two slots.
  */
-export function activitySpendsOnUse(_item: any, activity: any, spellLevel: number): boolean {
-  if (spellLevel > 0) return true;
+export function activitySpendsOnUse(
+  _item: any,
+  activity: any,
+  spendsSlot: number | boolean
+): boolean {
+  // round 5: true, or a spell level above 0, when the use spends a spell slot (a pact slot included)
+  if (spendsSlot === true || (typeof spendsSlot === 'number' && spendsSlot > 0)) return true;
   const targets = activity?.consumption?.targets;
   const n = Array.isArray(targets) ? targets.length : Number(targets?.size ?? targets?.length ?? 0);
   if (n > 0) return true;
@@ -729,6 +734,26 @@ export async function usageCostErrors(activity: any): Promise<string[] | null> {
 }
 
 /**
+ * Round 5: the spell slot this use spends, as dnd5e itself decides it (`_prepareUsageConfig`: `consume.spellSlot` and
+ * `spell.slot`): 'spell2', 'pact' for a warlock's pact magic, or null when the use spends no slot (a cantrip, an innate
+ * or at-will spell with its own uses). The bridge read only `spell<level>` before, so a pact caster was refused and an
+ * at-will spell was charged a slot. Falls back to `spell<level>` for a levelled spell when dnd5e cannot be asked.
+ */
+export function spellSlotKey(activity: any, item: any): string | null {
+  try {
+    if (typeof activity?._prepareUsageConfig === 'function') {
+      const c = activity._prepareUsageConfig({});
+      if (c?.consume === false || c?.consume?.spellSlot === false) return null;
+      if (c?.spell?.slot) return String(c.spell.slot);
+    }
+  } catch {
+    /* dnd5e could not be asked: the level below */
+  }
+  const lvl = Number(item?.system?.level) || 0;
+  return item?.type === 'spell' && lvl > 0 ? `spell${lvl}` : null;
+}
+
+/**
  * dnd5e's own "consumed" record (ActorDeltasData: actor `{keyPath, delta}` rows, item rows by id) for what a use spent,
  * built from two readings, so dnd5e's own `activity.refund(consumed)` can give it back when Midi-QOL refused the use
  * after paying for it. Only spell slots and limited uses (the item's and the activity's) are read.
@@ -736,7 +761,13 @@ export async function usageCostErrors(activity: any): Promise<string[] | null> {
 export function consumedDeltas(
   before: SpendState,
   after: SpendState,
-  ids: { spellLevel: number; itemId: string | null; activityId: string | null }
+  ids: {
+    spellLevel: number;
+    itemId: string | null;
+    activityId: string | null;
+    /** round 5: the slot the use spent ('spell2', 'pact'); by default `spell<spellLevel>` */
+    slotKey?: string | null;
+  }
 ): {
   actor: { keyPath: string; delta: number }[];
   item: Record<string, { keyPath: string; delta: number }[]>;
@@ -748,8 +779,8 @@ export function consumedDeltas(
   const dropped = (a: number | null, b: number | null) =>
     typeof a === 'number' && typeof b === 'number' && b < a ? a - b : 0;
   const s = dropped(before.slot, after.slot);
-  if (s && ids.spellLevel > 0)
-    out.actor.push({ keyPath: `system.spells.spell${ids.spellLevel}.value`, delta: -s });
+  const key = ids.slotKey ?? (ids.spellLevel > 0 ? `spell${ids.spellLevel}` : null);
+  if (s && key) out.actor.push({ keyPath: `system.spells.${key}.value`, delta: -s });
   const rows: { keyPath: string; delta: number }[] = [];
   const i = dropped(before.itemUses, after.itemUses);
   if (i) rows.push({ keyPath: 'system.uses.spent', delta: i });
@@ -787,20 +818,52 @@ function toChoice(ef: any): EffectChoice {
   };
 }
 
-/** The effects Midi-QOL would put on each affected target, for the one-of-them choice (see EffectChoice). */
-export function activityEffectChoices(activity: any, level?: number | null): EffectChoice[] {
+/**
+ * The effect DOCUMENTS Midi-QOL would apply for this activity at this level (its own isApplicableEffect): the ones on
+ * each affected target (`target`) and the caster's own (`self`, DAE selfTarget / selfTargetAlways). Round 5: the
+ * bridge's buff path applies exactly these (the ACTIVITY's list at the level cast), never the whole item's effects
+ * (Haste's other activity's Lethargy, Magic Weapon's +2 and +3 at level 2).
+ */
+export function activityEffectDocs(
+  activity: any,
+  level?: number | null
+): { target: any[]; self: any[] } {
   const lvl = Number.isFinite(level as number) ? Number(level) : Number(activity?.relevantLevel);
-  const out: EffectChoice[] = [];
+  const out = { target: [] as any[], self: [] as any[] };
   for (const ed of [...(activity?.effects ?? [])]) {
     const ef = ed?.effect;
     if (!ef || ef.transfer === true || ef.type === 'enchantment' || ed.onSave === true) continue;
     if (Number.isFinite(lvl)) {
       if ((ed.level?.min ?? -Infinity) > lvl || lvl > (ed.level?.max ?? Infinity)) continue;
     }
-    if (isSelfEffect(ef)) continue;
-    out.push(toChoice(ef));
+    (isSelfEffect(ef) ? out.self : out.target).push(ef);
   }
   return out;
+}
+
+/** The effects Midi-QOL would put on each affected target, for the one-of-them choice (see EffectChoice). */
+export function activityEffectChoices(activity: any, level?: number | null): EffectChoice[] {
+  return activityEffectDocs(activity, level).target.map(toChoice);
+}
+
+/**
+ * Round 5 (the re-review of round 4): several effects are a CHOICE only where the data says so, Midi-QOL's own
+ * `midiProperties.chooseEffects` on the activity. Otherwise several effects mean something the data does not tell:
+ * all of them (Mirror Image's three duplicates), by the target's hit points (Divine Word, Power Word Stun), at random
+ * (Prismatic Spray), by stage (a dragon's paralyzing breath), by the save's result (Ray of Enfeeblement), or one chosen
+ * but not marked (Blindness/Deafness, Hex in dnd5e 5.3.3's data). The bridge never applies all of them then.
+ */
+export function effectsNeedChoice(activity: any): boolean {
+  return activity?.midiProperties?.chooseEffects === true;
+}
+
+/** What the answer says when several effects are listed and the data does not say how they apply. */
+export function effectsUnclearWords(itemName: string, choices: EffectChoice[]): string {
+  return `${itemName} lists several effects (${choices
+    .map(c => c.name)
+    .join(
+      ', '
+    )}) and its data does not say how they apply (all of them, one chosen by the caster, by hit points, at random, by stage or by the save's result), so it is not used until its data says so; never all of them at once`;
 }
 
 /** The effects the bridge's own buff path would put on each target (the item's own, not the caster's). */

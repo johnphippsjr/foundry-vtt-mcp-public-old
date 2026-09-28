@@ -103,7 +103,7 @@ export class CombatTools {
             // Board #1887 (bridge 0.10.8 round 4, review S1): the rules say the caster chooses ONE effect.
             effect: {
               type: 'string',
-              description: `Only when the spell or ability puts ONE effect of the caster's choice on its target (Blindness/Deafness: "Blindness" or "Deafness"; Hex or Bestow Curse: the ability, e.g. "Strength"; Enlarge/Reduce: "Enlarged" or "Reduced"): the one chosen (the monster's choice, or what the player said). A condition name works too ("blinded"). When a choice is needed and none is named, nothing is used and the answer lists the choices (effectChoices).`,
+              description: `Only when the spell or ability puts ONE effect of the caster's choice on its target and its data marks that choice (Blindness/Deafness: "Blindness" or "Deafness"; Hex or Bestow Curse: the ability, e.g. "Strength"): the one chosen (the monster's choice, or what the player said). A condition name works too ("blinded"). When a choice is needed and none is named, nothing is used and the answer lists the choices (effectChoices). When the answer says needsData, the spell's effects are not described in its data yet (all of them, by hit points, at random...), so it cannot be used through this tool.`,
             },
           },
           required: ['attacker', 'item', 'targets'],

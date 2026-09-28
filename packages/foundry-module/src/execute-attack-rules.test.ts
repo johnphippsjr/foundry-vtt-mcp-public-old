@@ -81,6 +81,10 @@ let midiRefuseOver = 0;
 // then the workflow is aborted and handed back (0 = off); and a notice some other add-on shows during a use.
 let midiAbortLateOver = 0;
 let otherToast = '';
+// round 5: the fake Midi aborts a save workflow with no refusal words; or hands its effect chooser a list without the
+// caster's chosen effect
+let midiAbortSaveSilently = false;
+let midiDropsChosenEffect = false;
 
 function getProperty(obj: any, path: string) {
   return path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
@@ -320,7 +324,13 @@ function install(toks: Tok[]) {
       get center() {
         return { x: doc.x + GRID / 2, y: doc.y + GRID / 2 };
       },
-      setTarget() {},
+      // Foundry's Token#setTarget: the GM user's own target set
+      setTarget(on = true, opts: any = {}) {
+        const u = (globalThis as any).game.user;
+        if (opts.releaseOthers) u.targets = new Set();
+        if (on) u.targets.add(doc.object);
+        else u.targets.delete(doc.object);
+      },
       control() {},
     };
     return doc;
@@ -329,7 +339,7 @@ function install(toks: Tok[]) {
   const scene = { id: 'scene1', grid: { size: GRID }, tokens };
   const g: any = globalThis;
   g.game = {
-    user: { isGM: true },
+    user: { isGM: true, targets: new Set() },
     scenes: { active: scene, contents: [scene] },
     settings: {
       get(scope: string, name: string) {
@@ -341,7 +351,16 @@ function install(toks: Tok[]) {
       },
     },
   };
-  g.canvas = { dimensions: { distance: FT } };
+  g.canvas = {
+    dimensions: { distance: FT },
+    // Foundry 14's TokenLayer#setTargets (the call Midi-QOL's updateUserTargets makes): the GM's targets become
+    // exactly these tokens
+    tokens: {
+      setTargets(ids: string[]) {
+        g.game.user.targets = new Set(ids.map(id => tokens.get(id)?.object).filter(Boolean));
+      },
+    },
+  };
   g.ui = {
     notifications: {
       warn: (m: string) => warnings.push(`ui:${m}`),
@@ -473,7 +492,18 @@ function install(toks: Tok[]) {
     async completeActivityUse(activity: any, usage: any, dialog: any, _message: any) {
       const mo = usage?.midiOptions ?? {};
       const wo = { ...mo, ...(mo.workflowOptions ?? {}) };
-      midiCalls.push({ activity, usage, dialog });
+      midiCalls.push({
+        activity,
+        usage,
+        dialog,
+        // the GM's targets while Midi-QOL runs (what an AREA activity uses)
+        userTargets: [...g.game.user.targets].map((t: any) => t.id),
+      });
+      // completeActivityUse notes the targets it found and puts them back at its cleanup (utils.ts 2406, 2445)
+      const targetsFound = new Set(g.game.user.targets);
+      const putBackTargets = () => {
+        g.game.user.targets = new Set(targetsFound);
+      };
       // Midi-QOL's completeActivityUse tags the caller's own usage object (utils.ts: usage.sequenceId = randomID())
       usage.sequenceId = `seq${midiCalls.length}`;
       if (otherToast) g.ui.notifications.info(otherToast);
@@ -547,8 +577,11 @@ function install(toks: Tok[]) {
           w.unSuspend = async (ctx: any) => {
             if (!ctx?.itemUseComplete) return;
             w.suspended = false;
-            for (const tg of targets) docOf(tg).actor.system.attributes.hp.value -= 7;
+            // an AREA activity: Midi-QOL ignores targetsToUse and takes the GM's current targets
+            for (const tg of [...g.game.user.targets])
+              docOf(tg).actor.system.attributes.hp.value -= 7;
             w.currentAction = { name: 'WorkflowState_Completed' };
+            putBackTargets();
             resolve(w);
           };
         });
@@ -576,11 +609,19 @@ function install(toks: Tok[]) {
         if (listed.length && midiConfig.autoItemEffects !== 'off') {
           await g.Hooks.midiCall('midi-qol.preApplyDynamicEffects', w);
           let effs = listed.map((ed: any) => ed.effect);
+          if (midiDropsChosenEffect) effs = effs.slice(1);
           if (w.activity.midiProperties?.chooseEffects) effs = await w.chooseEffects(effs);
           for (const tg of targets)
             for (const ef of effs) docOf(tg).actor.effects.push({ name: ef.name });
         }
+        if (midiAbortSaveSilently) {
+          w.aborted = true;
+          w.currentAction = { name: 'WorkflowState_Abort' };
+          putBackTargets();
+          return w;
+        }
         w.currentAction = { name: 'WorkflowState_Cleanup' };
+        putBackTargets();
         return w;
       }
       if (midiDelayMs) await new Promise(r => setTimeout(r, midiDelayMs));
@@ -801,6 +842,8 @@ beforeEach(() => {
   midiRefuseOver = 0;
   midiAbortLateOver = 0;
   otherToast = '';
+  midiAbortSaveSilently = false;
+  midiDropsChosenEffect = false;
 });
 
 describe("bridge 0.10.8: the attack is Midi-QOL's own workflow (engine map M07)", () => {
@@ -2376,9 +2419,12 @@ function choiceSpell(
   name: string,
   level: number,
   effects: [string, string, string[]][],
-  type = 'save'
+  type = 'save',
+  // round 5: a choice only where the data says so (Midi-QOL's own chooseEffects on the activity)
+  choose = true
 ) {
   const { sp, act } = saveSpell(name, level);
+  act.midiProperties = { ...(act.midiProperties ?? {}), chooseEffects: choose };
   const efs = effects.map(([id, n, st]) => effectOf(sp.id, id, n, st));
   sp.effects = efs;
   act.effects = efs.map(ef => ({
@@ -2408,8 +2454,8 @@ describe("round 4: an activity that puts ONE effect of the caster's choice appli
     expect(brakka.effects.map((e: any) => e.name)).toEqual(['Blindness']);
     expect(res.results[0].effectChosen).toBe('Blindness');
     expect(openApps.size).toBe(0);
-    // Midi's switch is put back and the hook removed: the item is as it was
-    expect(act.midiProperties.chooseEffects).toBeFalsy();
+    // the item is as it was (its data's own switch) and the hook is removed
+    expect(act.midiProperties.chooseEffects).toBe(true);
     expect((globalThis as any).Hooks.count('midi-qol.preApplyDynamicEffects')).toBe(0);
   });
 
@@ -2441,7 +2487,13 @@ describe("round 4: an activity that puts ONE effect of the caster's choice appli
   });
 
   it('guard: an activity with ONE effect (Hold Person) needs no choice and applies it as before', async () => {
-    const { sp } = choiceSpell('Hold Person', 2, [['ePar', 'Paralyzed', ['paralyzed']]]);
+    const { sp } = choiceSpell(
+      'Hold Person',
+      2,
+      [['ePar', 'Paralyzed', ['paralyzed']]],
+      'save',
+      false
+    );
     const { kobold, brakka } = world({ targetFeet: 30, dagger: sp, attackerItems: [sp] });
     kobold.system.spells = { spell2: { value: 2, max: 2 } };
     const res = await attack('Hold Person');
@@ -2464,7 +2516,19 @@ describe("round 4: an activity that puts ONE effect of the caster's choice appli
     const six = ['Strength', 'Dexterity', 'Constitution', 'Intelligence', 'Wisdom', 'Charisma'].map(
       (a): [string, string, string[]] => ['e' + a.slice(0, 3), 'Hexed ' + a, ['cursed']]
     );
-    const { sp } = choiceSpell('Hex', 1, six, 'utility');
+    const { sp, act } = choiceSpell('Hex', 1, six, 'utility');
+    // round 5 (re-review nit 10): Hex as dnd5e 5.3.3's data has it on the test world (in this order): "Place Curse"
+    // (utility, the six curses), "Bonus Hex Damage" (damage, no effect), "Curse New Creature" (utility, the six)
+    act.name = 'Place Curse';
+    const rider: any = {
+      ...act,
+      id: 'actBonusHex',
+      name: 'Bonus Hex Damage',
+      type: 'damage',
+      effects: [],
+    };
+    const moveTo: any = { ...act, id: 'actCurseNew', name: 'Curse New Creature' };
+    sp.system.activities = new ValueCollection([act, rider, moveTo]);
     const { kobold, brakka } = world({ targetFeet: 30, dagger: sp, attackerItems: [sp] });
     kobold.system.spells = { spell1: { value: 2, max: 2 } };
     brakka.createEmbeddedDocuments = async (_t: string, docs: any[]) => {
@@ -2481,5 +2545,267 @@ describe("round 4: an activity that puts ONE effect of the caster's choice appli
     expect(res.success).toBe(true);
     expect(brakka.effects.map((e: any) => e.name)).toEqual(['Hexed Strength']);
     expect(res.results[0].effectChosen).toBe('Hexed Strength');
+  });
+});
+
+// ================================================================================================
+// Board #1887 (bridge 0.10.8 round 5): the re-review of 9a24c90
+// ================================================================================================
+
+describe('round 5, BLOCKER 1: every use targets EXACTLY the named creatures (an area activity uses the GM targets)', () => {
+  it('a save spell at Nim, then Fire Breath (an area) at Brakka: Nim takes no damage from the breath', async () => {
+    const { sp: flame } = saveSpell('Sacred Flame', 0);
+    const { sp: breath, act } = saveSpell('Fire Breath', 0);
+    act.target = { template: { type: 'line', size: 15 }, affects: {} };
+    const { brakka } = world({
+      targetFeet: 10,
+      dagger: flame,
+      attackerItems: [flame, breath],
+      extraTokens: [nimAt(3)],
+    });
+    const nim = tokens.get('nim').actor;
+    const h = new QueryHandlers() as any;
+    h.midiAttackTimeoutMs = 2000;
+    await h.handleExecuteAttack({ attacker: 'kobold', item: 'Sacred Flame', targets: ['nim'] });
+    const nimBefore = nim.system.attributes.hp.value;
+    const res = await h.handleExecuteAttack({
+      attacker: 'kobold',
+      item: 'Fire Breath',
+      targets: ['brakka'],
+    });
+    expect(res.success).toBe(true);
+    expect(midiCalls[1].userTargets).toEqual(['brakka']);
+    expect(brakka.system.attributes.hp.value).toBe(13);
+    expect(nim.system.attributes.hp.value).toBe(nimBefore);
+  });
+
+  it("the attack path sets the GM's targets too, gives Midi the snapshot, and puts the old targets back after", async () => {
+    world({ targetFeet: 5, extraTokens: [nimAt(3)] });
+    tokens.get('nim').object.setTarget(true, { releaseOthers: true });
+    await attack();
+    expect(midiCalls[0].userTargets).toEqual(['brakka']);
+    expect(midiCalls[0].usage.midiOptions.workflowOptions.preSelectedTargetUuids).toEqual([
+      'Scene.scene1.Token.brakka',
+    ]);
+    expect([...(globalThis as any).game.user.targets].map((t: any) => t.id)).toEqual(['nim']);
+  });
+});
+
+describe('round 5, item 5: a save workflow Midi-QOL aborted without saying why is an error', () => {
+  it('no success with no damage: the answer says Midi stopped it', async () => {
+    midiAbortSaveSilently = true;
+    const { sp } = saveSpell('Sacred Flame', 0);
+    world({ targetFeet: 30, dagger: sp, attackerItems: [sp] });
+    const res = await attack('Sacred Flame');
+    expect(res.success).toBe(false);
+    expect(res.results[0].error).toMatch(
+      /Midi-QOL stopped Sacred Flame \(its workflow was aborted/
+    );
+  });
+});
+
+describe('round 5, item 4: several effects are a choice ONLY where the data says so; never all of them', () => {
+  it('Blindness/Deafness whose data does not mark a choice: refused even with an effect named, nothing spent', async () => {
+    const { sp } = choiceSpell('Blindness/Deafness', 2, BLIND_DEAF, 'save', false);
+    const { kobold, brakka } = world({ targetFeet: 30, dagger: sp, attackerItems: [sp] });
+    kobold.system.spells = { spell2: { value: 2, max: 2 } };
+    const res = await attack('Blindness/Deafness', ['brakka'], undefined, { effect: 'blinded' });
+    expect(midiCalls).toHaveLength(0);
+    expect(kobold.system.spells.spell2.value).toBe(2);
+    expect(brakka.effects).toEqual([]);
+    expect(res.refused).toBe(true);
+    expect(res.results[0]).toMatchObject({
+      needsData: true,
+      refusedBy: 'rules',
+      effectsListed: ['Blindness', 'Deafness'],
+    });
+    expect(res.results[0].note).toMatch(/its data does not say how they apply/);
+  });
+
+  it("Mirror Image (range self, three duplicates): the caster's own effects, all three on the caster", async () => {
+    const { sp } = choiceSpell(
+      'Mirror Image',
+      2,
+      [
+        ['dA', 'Duplicate A', []],
+        ['dB', 'Duplicate B', []],
+        ['dC', 'Duplicate C', []],
+      ],
+      'utility',
+      false
+    );
+    sp.system.range = { units: 'self' };
+    const { kobold } = world({ targetFeet: 5, dagger: sp, attackerItems: [sp] });
+    kobold.system.spells = { spell2: { value: 1, max: 1 } };
+    kobold.createEmbeddedDocuments = async (_t: string, docs: any[]) => {
+      const made = docs.map(d => ({ ...d, id: d.name }));
+      kobold.effects.push(...made);
+      return made;
+    };
+    kobold.deleteEmbeddedDocuments = async () => [];
+    const res = await attack('Mirror Image', ['kobold']);
+    expect(res.success).toBe(true);
+    expect(kobold.effects.map((e: any) => e.name)).toEqual([
+      'Duplicate A',
+      'Duplicate B',
+      'Duplicate C',
+    ]);
+    expect(kobold.system.spells.spell2.value).toBe(0);
+  });
+
+  it('several effects at ANOTHER creature with no choice in the data (Power Word Stun, by hit points): refused, never all', async () => {
+    const { sp } = choiceSpell(
+      'Power Word Stun',
+      8,
+      [
+        ['st', 'Stunned', ['stunned']],
+        ['nm', 'No Movement', []],
+      ],
+      'utility',
+      false
+    );
+    const { kobold, brakka } = world({ targetFeet: 5, dagger: sp, attackerItems: [sp] });
+    kobold.system.spells = { spell8: { value: 1, max: 1 } };
+    const res = await attack('Power Word Stun');
+    expect(res.refused).toBe(true);
+    expect(res.results[0].effectsListed).toEqual(['Stunned', 'No Movement']);
+    expect(brakka.effects).toEqual([]);
+    expect(kobold.system.spells.spell8.value).toBe(1);
+  });
+
+  it("the buff path applies the ACTIVITY's own effects: Haste gives Hasted, never its other activity's Lethargy", async () => {
+    const { sp, act, efs } = choiceSpell('Haste', 3, [['eHaste', 'Hasted', []]], 'utility', false);
+    const lethargy = effectOf(sp.id, 'eLeth', 'Lethargy');
+    sp.effects = [...efs, lethargy];
+    const other: any = {
+      ...act,
+      id: 'actLethargy',
+      name: 'Apply Lethargy',
+      effects: [{ _id: 'eLeth', effect: lethargy, onSave: false, level: { min: null, max: null } }],
+    };
+    sp.system.activities = new ValueCollection([act, other]);
+    const { kobold, brakka } = world({ targetFeet: 5, dagger: sp, attackerItems: [sp] });
+    kobold.system.spells = { spell3: { value: 1, max: 1 } };
+    brakka.createEmbeddedDocuments = async (_t: string, docs: any[]) => {
+      const made = docs.map(d => ({ ...d, id: d.name }));
+      brakka.effects.push(...made);
+      return made;
+    };
+    brakka.deleteEmbeddedDocuments = async () => [];
+    const res = await attack('Haste');
+    expect(res.success).toBe(true);
+    expect(brakka.effects.map((e: any) => e.name)).toEqual(['Hasted']);
+  });
+
+  it('the buff path keeps to the level cast: an effect meant for higher levels is not applied', async () => {
+    const { sp, act } = choiceSpell(
+      'Warding Word',
+      1,
+      [
+        ['eL1', 'Ward +1', []],
+        ['eL3', 'Ward +3', []],
+      ],
+      'utility',
+      false
+    );
+    act.effects[0].level = { min: 1, max: 2 };
+    act.effects[1].level = { min: 3, max: null };
+    const { kobold, brakka } = world({ targetFeet: 5, dagger: sp, attackerItems: [sp] });
+    kobold.system.spells = { spell1: { value: 1, max: 1 } };
+    brakka.createEmbeddedDocuments = async (_t: string, docs: any[]) => {
+      const made = docs.map(d => ({ ...d, id: d.name }));
+      brakka.effects.push(...made);
+      return made;
+    };
+    brakka.deleteEmbeddedDocuments = async () => [];
+    const res = await attack('Warding Word');
+    expect(res.success).toBe(true);
+    expect(brakka.effects.map((e: any) => e.name)).toEqual(['Ward +1']);
+  });
+
+  it('an enchantment (Magic Weapon) is refused before anything is spent: it goes on an item, not a creature', async () => {
+    const { sp, act } = choiceSpell(
+      'Magic Weapon',
+      2,
+      [['mw1', 'Magic Weapon +1', []]],
+      'enchant',
+      false
+    );
+    act.effects[0].effect.type = 'enchantment';
+    const { kobold, brakka } = world({ targetFeet: 5, dagger: sp, attackerItems: [sp] });
+    kobold.system.spells = { spell2: { value: 1, max: 1 } };
+    const res = await attack('Magic Weapon');
+    expect(res.refused).toBe(true);
+    expect(res.results[0].note).toMatch(/enchants an item/);
+    expect(kobold.system.spells.spell2.value).toBe(1);
+    expect(brakka.effects).toEqual([]);
+  });
+
+  it('item 8: Midi-QOL not offering the chosen effect is a rule warning, not only an engine note', async () => {
+    midiDropsChosenEffect = true;
+    const { sp } = choiceSpell('Blindness/Deafness', 2, BLIND_DEAF);
+    const { kobold } = world({ targetFeet: 30, dagger: sp, attackerItems: [sp] });
+    kobold.system.spells = { spell2: { value: 2, max: 2 } };
+    const res = await attack('Blindness/Deafness', ['brakka'], undefined, { effect: 'blinded' });
+    expect(res.ruleWarnings).toContain(
+      'Midi-QOL did not offer Blindness, so no effect of the choice was applied'
+    );
+  });
+});
+
+describe("round 5, item 7: the slot a spell spends is dnd5e's (a warlock's pact slot; an at-will spell spends none)", () => {
+  const pactConfig = (slot: string | null) => () =>
+    slot ? { consume: { spellSlot: true }, spell: { slot } } : { consume: { spellSlot: false } };
+
+  it('a pact caster with no level-1 slot but a pact slot casts, and the PACT slot is spent', async () => {
+    const { sp, act } = choiceSpell(
+      'Armor of Agathys',
+      1,
+      [['aoa', 'Armor of Agathys', []]],
+      'utility',
+      false
+    );
+    act._prepareUsageConfig = pactConfig('pact');
+    const { kobold } = world({ targetFeet: 5, dagger: sp, attackerItems: [sp] });
+    kobold.system.spells = { spell1: { value: 0, max: 0 }, pact: { value: 1, max: 1, level: 1 } };
+    kobold.createEmbeddedDocuments = async (_t: string, docs: any[]) => docs;
+    kobold.deleteEmbeddedDocuments = async () => [];
+    const res = await attack('Armor of Agathys', ['kobold']);
+    expect(res.success).toBe(true);
+    expect(kobold.system.spells.pact.value).toBe(0);
+    expect(kobold.system.spells.spell1.value).toBe(0);
+  });
+
+  it("an at-will spell (no slot in dnd5e's own config) casts with no slot left and spends none", async () => {
+    const { sp, act } = choiceSpell(
+      'Disguise Self',
+      1,
+      [['ds', 'Disguised', []]],
+      'utility',
+      false
+    );
+    act._prepareUsageConfig = pactConfig(null);
+    const { kobold } = world({ targetFeet: 5, dagger: sp, attackerItems: [sp] });
+    kobold.system.spells = { spell1: { value: 0, max: 0 } };
+    kobold.createEmbeddedDocuments = async (_t: string, docs: any[]) => docs;
+    kobold.deleteEmbeddedDocuments = async () => [];
+    const res = await attack('Disguise Self', ['kobold']);
+    expect(res.success).toBe(true);
+    expect(res.error).toBeUndefined();
+  });
+
+  it('guard: a wizard with no level-1 slot is still refused', async () => {
+    const { sp } = choiceSpell(
+      'Shield of Faith',
+      1,
+      [['sof', 'Shimmering Field', []]],
+      'utility',
+      false
+    );
+    const { kobold } = world({ targetFeet: 5, dagger: sp, attackerItems: [sp] });
+    kobold.system.spells = { spell1: { value: 0, max: 2 } };
+    const res = await attack('Shield of Faith', ['kobold']);
+    expect(res.success).toBe(false);
+    expect(res.error).toBe('No level-1 spell slots remaining');
   });
 });

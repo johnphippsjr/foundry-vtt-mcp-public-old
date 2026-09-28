@@ -30,6 +30,12 @@ import {
   pickEffectChoice,
   effectChoiceWords,
   keepChosenEffect,
+  activityEffectDocs,
+  effectsNeedChoice,
+  effectsUnclearWords,
+  spellSlotKey,
+  consumedDeltas as consumedDeltas5,
+  activitySpendsOnUse as spendsOnUse5,
 } from './attack-rules-utils.js';
 
 const DAGGER = ['oneHanded', 'offhand', null, 'thrown', 'thrown-offhand'];
@@ -654,5 +660,81 @@ describe("round 4 (review S1): one effect of the caster's choice", () => {
     expect(
       keepChosenEffect([{ ...b, uuid: 'Scene.s.Token.t.Actor.x.Item.i.ActiveEffect.b' }], chosen)
     ).toHaveLength(1);
+  });
+});
+
+describe('round 5: the activity list, the data-marked choice, the slot a use spends', () => {
+  const ef = (id: string, name: string, extra: any = {}) => ({
+    id,
+    uuid: `Item.i.ActiveEffect.${id}`,
+    name,
+    statuses: new Set(),
+    transfer: false,
+    type: 'base',
+    flags: {},
+    ...extra,
+  });
+  it("the activity's own effects at the level cast, the caster's own ones apart", () => {
+    const act = {
+      effects: [
+        { _id: 'a', effect: ef('a', 'Ward +1'), level: { min: 1, max: 2 } },
+        { _id: 'b', effect: ef('b', 'Ward +3'), level: { min: 3, max: null } },
+        { _id: 'c', effect: ef('c', 'Mark', { flags: { dae: { selfTarget: true } } }), level: {} },
+      ],
+    };
+    const d = activityEffectDocs(act, 1);
+    expect(d.target.map((e: any) => e.name)).toEqual(['Ward +1']);
+    expect(d.self.map((e: any) => e.name)).toEqual(['Mark']);
+    expect(activityEffectDocs(act, 3).target.map((e: any) => e.name)).toEqual(['Ward +3']);
+  });
+
+  it("a choice only where Midi-QOL's own chooseEffects says so", () => {
+    expect(effectsNeedChoice({ midiProperties: { chooseEffects: true } })).toBe(true);
+    expect(effectsNeedChoice({ midiProperties: { chooseEffects: false } })).toBe(false);
+    expect(effectsNeedChoice({})).toBe(false);
+    expect(
+      effectsUnclearWords('Mirror Image', [
+        { name: 'Duplicate A', id: 'a', uuid: null, statuses: [] },
+        { name: 'Duplicate B', id: 'b', uuid: null, statuses: [] },
+      ])
+    ).toMatch(
+      /Mirror Image lists several effects \(Duplicate A, Duplicate B\).*never all of them at once/
+    );
+  });
+
+  it("the slot is dnd5e's own choice: pact, none, or spell<level> when dnd5e cannot be asked", () => {
+    const spell = { type: 'spell', system: { level: 2 } };
+    expect(
+      spellSlotKey(
+        { _prepareUsageConfig: () => ({ consume: { spellSlot: true }, spell: { slot: 'pact' } }) },
+        spell
+      )
+    ).toBe('pact');
+    expect(
+      spellSlotKey({ _prepareUsageConfig: () => ({ consume: { spellSlot: false } }) }, spell)
+    ).toBe(null);
+    expect(spellSlotKey({}, spell)).toBe('spell2');
+    expect(spellSlotKey({}, { type: 'spell', system: { level: 0 } })).toBe(null);
+    expect(
+      spellSlotKey(
+        {
+          _prepareUsageConfig: () => {
+            throw new Error('x');
+          },
+        },
+        spell
+      )
+    ).toBe('spell2');
+  });
+
+  it("a pact slot's refund row names the pact slot; spending a slot is spending on use", () => {
+    const d = consumedDeltas5(
+      { slot: 1, itemUses: null, activityUses: null },
+      { slot: 0, itemUses: null, activityUses: null },
+      { spellLevel: 1, itemId: 'i', activityId: 'a', slotKey: 'pact' }
+    );
+    expect(d.actor).toEqual([{ keyPath: 'system.spells.pact.value', delta: -1 }]);
+    expect(spendsOnUse5({}, {}, true)).toBe(true);
+    expect(spendsOnUse5({}, {}, false)).toBe(false);
   });
 });
