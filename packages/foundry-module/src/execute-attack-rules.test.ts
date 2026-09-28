@@ -68,6 +68,11 @@ let applyDamageCalls: any[] = [];
 let openApps: Map<string, any>;
 let liveWorkflows: Map<string, any>;
 let midiConfig: any;
+// Board #1887 (bridge 0.10.8 review): pairs "attackerId>targetId" where the attacker cannot see the target (Midi's
+// canSee answers false), a delay before Midi's workflow answers, and the dialogs the stuck workflow opens.
+let unseen: Set<string>;
+let midiDelayMs = 0;
+let stuckDialogs: string[] = ['AttackRollConfigurationDialog'];
 
 function getProperty(obj: any, path: string) {
   return path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
@@ -406,16 +411,16 @@ function install(toks: Tok[]) {
       WorkflowState_Abort: { name: 'WorkflowState_Abort' },
     };
     liveWorkflows.set(id, w);
-    if (dialog) {
+    for (const name of dialog ? [dialog, ...stuckDialogs.filter(n => n !== dialog)] : []) {
       const app: any = {
-        constructor: { name: dialog },
+        constructor: { name },
         closed: false,
         async close() {
           app.closed = true;
-          openApps.delete(dialog);
+          openApps.delete(name);
         },
       };
-      openApps.set(dialog, app);
+      openApps.set(name, app);
     }
     return w;
   };
@@ -426,9 +431,9 @@ function install(toks: Tok[]) {
       return distance(a, b, opts);
     },
     computeDistance: distance,
-    canSee: () => {
+    canSee: (a: any, b: any) => {
       maybeThrow('canSee');
-      return true;
+      return !unseen.has(`${docOf(a).id}>${docOf(b).id}`);
     },
     checkActivityRange(activity: any, tokenObj: any, targets: Set<any>) {
       maybeThrow('checkActivityRange');
@@ -447,8 +452,6 @@ function install(toks: Tok[]) {
       const actor = item.parent;
       const attDoc = tokens.contents.find((t: any) => t.actor === actor);
       const targets = [...(mo.targetsToUse ?? [])];
-      const tgt = targets[0];
-      const tDoc = docOf(tgt);
       const wfId = `wf${midiCalls.length}`;
       // A roll dialog in a browser nobody sits at: the workflow waits for ever.
       const dialogForced =
@@ -473,8 +476,9 @@ function install(toks: Tok[]) {
           aborted: false,
           attackRoll: null,
         };
+      if (midiDelayMs) await new Promise(r => setTimeout(r, midiDelayMs));
       // ValidateRoll: Midi's own range check.
-      const rv = rangeVerdict(activity, attDoc.object, [tgt]);
+      const rv = rangeVerdict(activity, attDoc.object, targets);
       if (rv.result === 'fail')
         return {
           currentAction: { name: 'WorkflowState_RollFinished' },
@@ -490,10 +494,12 @@ function install(toks: Tok[]) {
       if (evalFlag(actor, 'flags.midi-qol.advantage.attack.all'))
         add('ADV', 'attack.all', 'Pack Tactics - Advantage Attack (All)');
       const optional = !!midiConfig.optionalRulesEnabled;
+      // checkAttackAdvantage reads the FIRST target (Workflow.ts `this.targets.first()`)
+      const first = docOf(targets[0]);
       const ranged =
         ['rwak', 'rsak'].includes(activity.actionType) ||
         (item.system.properties?.has('thr') &&
-          distance(attDoc, tDoc) > (Number(item.system.range?.reach) || 5));
+          distance(attDoc, first) > (Number(item.system.range?.reach) || 5));
       if (
         optional &&
         midiRules.nearbyFoe &&
@@ -502,6 +508,9 @@ function install(toks: Tok[]) {
         nearbyFoe(attDoc.object, midiRules.nearbyFoe)
       )
         add('DIS', 'nearbyFoe', 'Nearby foe');
+      // invisAdvantage RAW2024 (an optional rule): an attacker that cannot see its target has Disadvantage.
+      if (optional && unseen.has(`${attDoc.id}>${first.id}`))
+        add('DIS', 'Defender not detected', 'Defender not detected');
       const adv = !!attribution.ADV;
       const dis = !!attribution.DIS;
       const rolls = await activity.rollAttack(
@@ -517,14 +526,27 @@ function install(toks: Tok[]) {
       const roll = rolls[0];
       const crit = !!roll.isCritical;
       const fumble = !!roll.isFumble;
-      const baseAc = tDoc.actor.system.attributes.ac.value;
-      const ac = baseAc + (tDoc.cover === Infinity ? Infinity : tDoc.cover || 0);
-      let hit = Number.isFinite(ac) && (crit || (!fumble && roll.total >= ac));
-      // checkHits, reactions: without DAE, a reaction prompt crashes the workflow (doReactions).
-      if (hit && tDoc.actor.reactions?.length && !wo.noProvokeReaction) {
-        const w = stuck(wfId, 'WorkflowState_AttackRollComplete');
-        w.activity = activity;
-        return new Promise(() => {});
+      // checkHits: the one roll against each target's AC (attackPerTarget off, the worlds' setting)
+      const hits: any[] = [];
+      const hitDisplayData: any = {};
+      for (const tgt of targets) {
+        const tDoc = docOf(tgt);
+        const baseAc = tDoc.actor.system.attributes.ac.value;
+        const ac = baseAc + (tDoc.cover === Infinity ? Infinity : tDoc.cover || 0);
+        const hit = Number.isFinite(ac) && (crit || (!fumble && roll.total >= ac));
+        // reactions: without DAE, a reaction prompt crashes the workflow (doReactions).
+        if (hit && tDoc.actor.reactions?.length && !wo.noProvokeReaction) {
+          const w = stuck(wfId, 'WorkflowState_AttackRollComplete');
+          w.activity = activity;
+          return new Promise(() => {});
+        }
+        if (hit) hits.push(tgt);
+        hitDisplayData[tDoc.uuid] = {
+          ac,
+          acDisplay: Number.isFinite(ac) ? String(ac) : 'infinite',
+          baseAc,
+          attackTotal: roll.total,
+        };
       }
       const wf: any = {
         currentAction: { name: 'WorkflowState_Cleanup' },
@@ -533,42 +555,37 @@ function install(toks: Tok[]) {
         attackTotal: roll.total,
         isCritical: crit,
         isFumble: fumble,
-        hitTargets: new Set(hit ? [tgt] : []),
+        hitTargets: new Set(hits),
         hitTargetsEC: new Set(),
         attackRollModifierTracker: { attribution },
-        hitDisplayData: {
-          [tDoc.uuid]: {
-            ac,
-            acDisplay: Number.isFinite(ac) ? String(ac) : '∞',
-            baseAc,
-            attackTotal: roll.total,
-          },
-        },
+        hitDisplayData,
         damageRolls: [],
         damageList: [],
       };
-      if (hit) {
+      if (hits.length) {
+        // one damage roll for the whole workflow, applied to each target hit
         const dr = await activity.rollDamage({
           isCritical: crit,
           criticalDice: MIDI_CRIT_CHOICES.includes(midiConfig.criticalDamageGM),
           attackMode: wo.attackMode,
         });
         wf.damageRolls = dr ?? [];
-        const byType = new Map<string, number>();
-        for (const r of wf.damageRolls)
-          byType.set(r.options?.type, (byType.get(r.options?.type) ?? 0) + r.total);
-        let total = 0;
-        const detail: any[] = [];
-        for (const [type, v] of byType) {
-          const val = tDoc.actor.system.traits?.dr?.value?.has(type) ? Math.floor(v / 2) : v;
-          detail.push({ type, value: val });
-          total += val;
-        }
-        total = Math.max(0, total);
-        const hp = tDoc.actor.system.attributes.hp;
-        const hpDamage = Math.min(total, hp.value);
-        wf.damageList = [
-          {
+        for (const tgt of hits) {
+          const tDoc = docOf(tgt);
+          const byType = new Map<string, number>();
+          for (const r of wf.damageRolls)
+            byType.set(r.options?.type, (byType.get(r.options?.type) ?? 0) + r.total);
+          let total = 0;
+          const detail: any[] = [];
+          for (const [type, v] of byType) {
+            const val = tDoc.actor.system.traits?.dr?.value?.has(type) ? Math.floor(v / 2) : v;
+            detail.push({ type, value: val });
+            total += val;
+          }
+          total = Math.max(0, total);
+          const hp = tDoc.actor.system.attributes.hp;
+          const hpDamage = Math.min(total, hp.value);
+          wf.damageList.push({
             targetUuid: tDoc.uuid,
             oldHP: hp.value,
             newHP: hp.value - hpDamage,
@@ -576,9 +593,9 @@ function install(toks: Tok[]) {
             tempDamage: 0,
             totalDamage: total,
             damageDetail: detail,
-          },
-        ];
-        if (midiConfig.autoApplyDamage === 'yes') hp.value -= hpDamage;
+          });
+          if (midiConfig.autoApplyDamage === 'yes') hp.value -= hpDamage;
+        }
       }
       return wf;
     },
@@ -646,6 +663,9 @@ beforeEach(() => {
   // (the world holds 'none'; that case has its own tests), damage applied automatically.
   midiConfig = { optionalRulesEnabled: false, criticalDamageGM: 'default', autoApplyDamage: 'yes' };
   midiThrows = {};
+  unseen = new Set();
+  midiDelayMs = 0;
+  stuckDialogs = ['AttackRollConfigurationDialog'];
 });
 
 describe("bridge 0.10.8: the attack is Midi-QOL's own workflow (engine map M07)", () => {
@@ -1416,11 +1436,12 @@ describe('finding 5: a check the engine could not make is reported, never droppe
     expect(res.ruleWarnings?.join(' ')).toMatch(/walls on\) could not be measured/);
   });
 
-  it('the sight check throws: reported', async () => {
+  it('an attack no longer asks the sight check at all, so it cannot fail on it (Midi decides unseen targets)', async () => {
     midiThrows.canSee = true;
     world({ targetFeet: 10 });
     const res = await attack();
-    expect(res.ruleWarnings?.join(' ')).toMatch(/sight check for Brakka failed/);
+    expect(res.success).toBe(true);
+    expect(res.ruleWarnings).toBeUndefined();
   });
 
   it('guard: a normal attack carries no warnings at all', async () => {
@@ -1471,5 +1492,200 @@ describe('usedUp: how many the roll really used up', () => {
     const res = await attack();
     expect(res.results[0].thrown).toBe(false);
     expect(res.results[0].usedUp).toBe(0);
+  });
+});
+
+// ================================================================================================
+// Board #1887, independent review of bridge 0.10.8 (618a313, HOLD): the blocker and the non-blocking fixes.
+// ================================================================================================
+function levelledSpell(name: string, level = 1) {
+  return makeWeapon({
+    name,
+    type: 'spell',
+    quantity: 1,
+    level,
+    range: { value: 120, long: null, units: 'ft' },
+    properties: [],
+    attackModes: [],
+    actionType: 'rsak',
+  });
+}
+
+const nimAt = (sq: number, sy = 0) => ({
+  id: 'nim',
+  name: 'Nim',
+  sq,
+  sy,
+  disposition: 1,
+  actor: makeActor('Nim', [], 10, 13),
+});
+
+describe('BLOCKER: a spell that spends a slot is cast ONCE for all its targets', () => {
+  it('a levelled spell attack at two targets: one Midi workflow with both targets, exactly one slot spent', async () => {
+    const bolt = levelledSpell('Scorching Ray', 2);
+    const { kobold } = world({
+      targetFeet: 30,
+      dagger: bolt,
+      attackerItems: [bolt],
+      extraTokens: [nimAt(8)],
+    });
+    kobold.system.spells = { spell2: { value: 2, max: 2 } };
+    d20Queue = [15]; // one roll for the one workflow: 19 hits AC 16 (Brakka) and AC 13 (Nim)
+    const res = await attack('Scorching Ray', ['brakka', 'nim']);
+    expect(midiCalls).toHaveLength(1);
+    expect([...midiCalls[0].usage.midiOptions.targetsToUse].map((t: any) => t.id)).toEqual([
+      'brakka',
+      'nim',
+    ]);
+    expect(kobold.system.spells.spell2.value).toBe(1);
+    expect(res.results.map((r: any) => [r.target, r.hit, r.damage])).toEqual([
+      ['Brakka', true, 4],
+      ['Nim', true, 4],
+    ]);
+    expect(res.results.every((r: any) => r.oneUseForAllTargets === true)).toBe(true);
+  });
+
+  it('each target keeps its own result from the one workflow (one hit, one miss)', async () => {
+    const bolt = levelledSpell('Guiding Bolt');
+    const { kobold } = world({
+      targetFeet: 30,
+      dagger: bolt,
+      attackerItems: [bolt],
+      extraTokens: [nimAt(8)],
+    });
+    kobold.system.spells = { spell1: { value: 1, max: 1 } };
+    d20Queue = [10]; // 14: misses Brakka (AC 16), hits Nim (AC 13)
+    const res = await attack('Guiding Bolt', ['brakka', 'nim']);
+    expect(res.results.map((r: any) => [r.target, r.hit, r.targetAC])).toEqual([
+      ['Brakka', false, 16],
+      ['Nim', true, 13],
+    ]);
+    expect(kobold.system.spells.spell1.value).toBe(0);
+  });
+
+  it('guard: a weapon at two targets is still two attacks, one Midi workflow each', async () => {
+    const club = makeWeapon({
+      name: 'Club',
+      quantity: 1,
+      range: { value: null, long: null, reach: 5 },
+      properties: ['lgt'],
+      attackModes: [{ value: 'oneHanded' }],
+    });
+    world({ targetFeet: 5, dagger: club, attackerItems: [club], extraTokens: [nimAt(1, 1)] });
+    await attack('Club', ['brakka', 'nim']);
+    expect(midiCalls).toHaveLength(2);
+  });
+
+  it('a stopped spell attack that already spent its slot says so', async () => {
+    const bolt = levelledSpell('Guiding Bolt');
+    const knight = makeActor('Brakka', [], 20, 16, {}, { reactions: ['Parry'] });
+    const { kobold } = world({
+      targetFeet: 30,
+      dagger: bolt,
+      attackerItems: [bolt],
+      target: knight,
+    });
+    kobold.system.spells = { spell1: { value: 2, max: 2 } };
+    d20Queue = [15];
+    const res = await attack('Guiding Bolt', ['brakka'], undefined, { reactions: true });
+    const r = res.results[0];
+    expect(r.error).toMatch(/did not finish/);
+    expect(r.spentAlthoughStopped).toBe('a spell slot');
+    expect(kobold.system.spells.spell1.value).toBe(1);
+    expect(res.ruleWarnings?.join(' ')).toMatch(
+      /was stopped, but Guiding Bolt still spent a spell slot/
+    );
+  });
+});
+
+describe("a stuck workflow: every dialog it opened is closed, the GM browser's own windows are not", () => {
+  it("the roll dialog AND dnd5e's usage dialog for the other activity are closed; a window open before stays", async () => {
+    stuckDialogs = ['AttackRollConfigurationDialog', 'ActivityUsageDialog'];
+    const chat: any = {
+      constructor: { name: 'ChatLog5e' },
+      async close() {
+        throw new Error('must not close');
+      },
+    };
+    const dagger = makeDagger(2, { midiProperties: { forceRollDialog: 'always' } });
+    world({ targetFeet: 5, dagger, attackerItems: [dagger] });
+    openApps.set('ChatLog5e', chat);
+    const res = await attack();
+    expect(res.results[0].error).toMatch(/AttackRollConfigurationDialog, ActivityUsageDialog/);
+    expect([...openApps.keys()]).toEqual(['ChatLog5e']);
+  });
+});
+
+describe('one deadline for the whole call (the MCP side waits 60 s)', () => {
+  it('slow targets do not add up: a target whose attack cannot start in time is not attacked, and says so', async () => {
+    const club = makeWeapon({
+      name: 'Club',
+      quantity: 1,
+      range: { value: null, long: null, reach: 5 },
+      properties: ['lgt'],
+      attackModes: [{ value: 'oneHanded' }],
+    });
+    world({ targetFeet: 5, dagger: club, attackerItems: [club], extraTokens: [nimAt(1, 1)] });
+    midiDelayMs = 150; // each Midi workflow answers after 150 ms
+    const h = new QueryHandlers() as any;
+    h.midiAttackTimeoutMs = 1000;
+    h.midiCallBudgetMs = 250;
+    h.midiDeadlineMarginMs = 20;
+    h.midiMinRunMs = 100;
+    const res = await h.handleExecuteAttack({
+      attacker: 'kobold',
+      item: 'Club',
+      targets: ['brakka', 'nim'],
+    });
+    expect(midiCalls).toHaveLength(1);
+    expect(res.results[0].error).toBeNull();
+    expect(res.results[1].error).toMatch(/^not attacked: no time was left in this call/);
+  });
+
+  it("a run is never given more than the call's time left", async () => {
+    world({ targetFeet: 5 });
+    midiDelayMs = 400; // longer than the call has left
+    const h = new QueryHandlers() as any;
+    h.midiAttackTimeoutMs = 5000;
+    h.midiCallBudgetMs = 300;
+    h.midiDeadlineMarginMs = 50;
+    h.midiMinRunMs = 50;
+    const t0 = Date.now();
+    const res = await h.handleExecuteAttack({
+      attacker: 'kobold',
+      item: 'Dagger',
+      targets: ['brakka'],
+    });
+    expect(Date.now() - t0).toBeLessThan(380);
+    expect(res.results[0].error).toMatch(/did not finish within/);
+  });
+});
+
+describe('an unseen target: the engine decides, the bridge no longer refuses (2024 rules)', () => {
+  it('an attack on a target the attacker cannot see is made, not refused', async () => {
+    world({ targetFeet: 5 });
+    unseen.add('kobold>brakka');
+    const res = await attack();
+    expect(res.refused).toBeUndefined();
+    expect(res.results[0].outOfSight).toBeUndefined();
+    expect(midiCalls).toHaveLength(1);
+  });
+
+  it("with Midi's rules on, Midi gives the Disadvantage and its reason is passed on", async () => {
+    midiConfig.optionalRulesEnabled = true;
+    world({ targetFeet: 5 });
+    unseen.add('kobold>brakka');
+    const res = await attack();
+    expect(res.results[0].disadvantage).toBe(true);
+    expect(res.results[0].disadvantageReasons).toEqual(['Defender not detected']);
+  });
+
+  it("a wall in the way is still refused (Midi's own range check), with the same words", async () => {
+    world({ targetFeet: 10 });
+    unseen.add('kobold>brakka');
+    walls.add(key({ id: 'kobold' }, { id: 'brakka' }));
+    const res = await attack();
+    expect(res.refused).toBe(true);
+    expect(res.results[0].note).toBe('a wall is in the way: Dagger cannot reach Brakka');
   });
 });

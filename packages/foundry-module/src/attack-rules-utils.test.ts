@@ -15,6 +15,8 @@ import {
   midiCriticalDamageProblem,
   MIDI_CRITICAL_DAMAGE_CHOICES,
   readMidiAttack,
+  activitySpendsOnUse,
+  spentOnUse,
 } from './attack-rules-utils.js';
 
 const DAGGER = ['oneHanded', 'offhand', null, 'thrown', 'thrown-offhand'];
@@ -397,5 +399,37 @@ describe("readMidiAttack: what Midi-QOL's workflow decided", () => {
   it('the hit is matched by token id when the uuid differs (an unlinked token)', () => {
     const r = readMidiAttack(wf(), { uuid: 'Scene.s1.Token.other', id: 'hero' });
     expect(r.hit).toBe(true);
+  });
+});
+
+// Board #1887, review of bridge 0.10.8 (618a313): what a use spends, once for all targets.
+describe('activitySpendsOnUse: used once for all targets', () => {
+  it('a levelled spell, or an activity with consumption targets or limited uses', () => {
+    expect(activitySpendsOnUse({ type: 'spell' }, {}, 1)).toBe(true);
+    expect(activitySpendsOnUse({}, { consumption: { targets: [{ type: 'itemUses' }] } }, 0)).toBe(
+      true
+    );
+    expect(activitySpendsOnUse({}, { uses: { max: '3' } }, 0)).toBe(true);
+  });
+  it('a cantrip or a plain weapon attack: no (one attack per target, as before)', () => {
+    expect(activitySpendsOnUse({ type: 'spell' }, { consumption: { targets: [] } }, 0)).toBe(false);
+    expect(activitySpendsOnUse({ type: 'weapon' }, { uses: { max: '' } }, 0)).toBe(false);
+    expect(activitySpendsOnUse({ type: 'weapon' }, {}, 0)).toBe(false);
+  });
+});
+
+describe('spentOnUse: what a use spent, in plain words', () => {
+  it('a slot, uses, or nothing', () => {
+    const n = { slot: null, itemUses: null, activityUses: null };
+    expect(spentOnUse({ ...n, slot: 2 }, { ...n, slot: 1 })).toEqual({
+      any: true,
+      words: 'a spell slot',
+    });
+    expect(spentOnUse({ ...n, itemUses: 3 }, { ...n, itemUses: 1 })).toEqual({
+      any: true,
+      words: '2 uses of the item',
+    });
+    expect(spentOnUse({ ...n, slot: 1 }, { ...n, slot: 1 })).toEqual({ any: false, words: '' });
+    expect(spentOnUse(n, n).any).toBe(false);
   });
 });

@@ -496,3 +496,50 @@ export function readMidiAttack(wf: any, ref: MidiTargetRef): MidiAttackReadback 
   }
   return out;
 }
+
+// ================================================================================================
+// Bridge 0.10.8 review (board #1887): what an attack spends when its activity is USED, and the call's deadline.
+// ================================================================================================
+
+/** How close to the whole call's deadline a Midi run may end (the call still has to answer), and the least time worth
+ * starting a run with. The MCP side waits 60 s for the whole execute-attack call. */
+export const MIDI_DEADLINE_MARGIN_MS = 3000;
+export const MIDI_MIN_RUN_MS = 3000;
+
+/**
+ * Does using this activity spend something that must be spent ONCE, however many targets it has? dnd5e's
+ * `activity.use` spends a levelled spell's slot, and any consumption target the activity lists (the item's or the
+ * activity's limited uses, a resource); a weapon attack's ammunition and a thrown weapon are spent by the ROLL, not by
+ * `use`. Such an activity is used once for all its targets (one Midi-QOL workflow); anything else is one workflow per
+ * target, one attack each, as before. Measured on the test stack 2026-09-27 before this fix: Guiding Bolt at two
+ * targets through one workflow per target spent two slots.
+ */
+export function activitySpendsOnUse(_item: any, activity: any, spellLevel: number): boolean {
+  if (spellLevel > 0) return true;
+  const targets = activity?.consumption?.targets;
+  const n = Array.isArray(targets) ? targets.length : Number(targets?.size ?? targets?.length ?? 0);
+  if (n > 0) return true;
+  const uses = activity?.uses?.max;
+  if (uses !== undefined && uses !== null && uses !== '' && Number(uses) !== 0) return true;
+  return false;
+}
+
+export interface SpendState {
+  slot: number | null;
+  itemUses: number | null;
+  activityUses: number | null;
+}
+
+/** What was spent between two readings of a spell slot, the item's uses and the activity's uses, in plain words. */
+export function spentOnUse(before: SpendState, after: SpendState): { any: boolean; words: string } {
+  const parts: string[] = [];
+  const dropped = (a: number | null, b: number | null) =>
+    typeof a === 'number' && typeof b === 'number' && b < a ? a - b : 0;
+  const s = dropped(before.slot, after.slot);
+  if (s) parts.push(s === 1 ? 'a spell slot' : `${s} spell slots`);
+  const i = dropped(before.itemUses, after.itemUses);
+  if (i) parts.push(i === 1 ? 'a use of the item' : `${i} uses of the item`);
+  const a = dropped(before.activityUses, after.activityUses);
+  if (a) parts.push(a === 1 ? 'a use of the action' : `${a} uses of the action`);
+  return { any: parts.length > 0, words: parts.join(' and ') };
+}
