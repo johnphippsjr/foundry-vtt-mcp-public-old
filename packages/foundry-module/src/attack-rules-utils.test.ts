@@ -19,6 +19,17 @@ import {
   spentOnUse,
   guardStoppedWorkflow,
   MIDI_STATES_AFTER_STOP,
+  engineTargetCount,
+  wrongNumberTargetsWords,
+  isMidiRefusalText,
+  usageCostErrors,
+  consumedDeltas,
+  midiSaveOptions,
+  activityEffectChoices,
+  itemEffectChoices,
+  pickEffectChoice,
+  effectChoiceWords,
+  keepChosenEffect,
 } from './attack-rules-utils.js';
 
 const DAGGER = ['oneHanded', 'offhand', null, 'thrown', 'thrown-offhand'];
@@ -481,5 +492,167 @@ describe('guardStoppedWorkflow: a stopped workflow goes to Abort from any later 
   });
   it('nothing to guard on a missing workflow', () => {
     expect(guardStoppedWorkflow(null)).toEqual([]);
+  });
+});
+
+// Board #1887 (bridge 0.10.8 round 4)
+describe("engineTargetCount: the activity's own evaluated target count", () => {
+  it('a number, a numeric string, and none', () => {
+    expect(engineTargetCount({ target: { affects: { count: 1 } } })).toBe(1);
+    expect(engineTargetCount({ target: { affects: { count: '3' } } })).toBe(3);
+    expect(engineTargetCount({ target: { affects: { count: '' } } })).toBeNull();
+    expect(engineTargetCount({ target: { affects: {} } })).toBeNull();
+    expect(engineTargetCount({ target: { affects: { count: 0 } } })).toBeNull();
+    expect(engineTargetCount(null)).toBeNull();
+  });
+});
+
+describe("Midi-QOL's own refusal words", () => {
+  it('the too-many-targets text, from the world or in English', () => {
+    expect(wrongNumberTargetsWords(1)).toBe(
+      'You must target at most 1 token(s) before rolling the attack'
+    );
+    expect(wrongNumberTargetsWords(2, (_k, d) => `Au plus ${d.allowedTargets} cibles`)).toBe(
+      'Au plus 2 cibles'
+    );
+    expect(wrongNumberTargetsWords(2, k => k)).toBe(
+      'You must target at most 2 token(s) before rolling the attack'
+    );
+  });
+  it("only Midi's refusal texts count as a refusal", () => {
+    expect(isMidiRefusalText('You must target at most 3 token(s) before rolling the attack')).toBe(
+      true
+    );
+    expect(isMidiRefusalText('You must target a token before rolling the attack')).toBe(true);
+    expect(isMidiRefusalText('Some add-on says hello')).toBe(false);
+    expect(isMidiRefusalText('')).toBe(false);
+    const fr = (k: string) =>
+      k === 'midi-qol.wrongNumberTargets' ? 'Au plus {allowedTargets} cibles' : k;
+    expect(isMidiRefusalText('Au plus 2 cibles', fr)).toBe(true);
+  });
+});
+
+describe("usageCostErrors: dnd5e's own check of what a use costs", () => {
+  it("dnd5e's messages when it cannot pay, none when it can, null when it cannot check", async () => {
+    const act = (errors: string[]) => ({
+      _prepareUsageConfig: (c: any) => c,
+      _prepareUsageUpdates: async (_c: any, o: any) =>
+        errors.length && o.returnErrors ? errors.map(m => ({ message: m })) : {},
+    });
+    expect(await usageCostErrors(act(['No uses on X available to spend, 1 required.']))).toEqual([
+      'No uses on X available to spend, 1 required.',
+    ]);
+    expect(await usageCostErrors(act([]))).toEqual([]);
+    expect(await usageCostErrors({})).toBeNull();
+  });
+});
+
+describe("consumedDeltas: dnd5e's own refund record from two readings", () => {
+  it('a slot and a use of the item and of the activity', () => {
+    const d = consumedDeltas(
+      { slot: 3, itemUses: 2, activityUses: 1 },
+      { slot: 2, itemUses: 1, activityUses: 0 },
+      { spellLevel: 1, itemId: 'i1', activityId: 'a1' }
+    );
+    expect(d.actor).toEqual([{ keyPath: 'system.spells.spell1.value', delta: -1 }]);
+    expect(d.item).toEqual({
+      i1: [
+        { keyPath: 'system.uses.spent', delta: 1 },
+        { keyPath: 'system.activities.a1.uses.spent', delta: 1 },
+      ],
+    });
+  });
+  it('nothing spent, nothing to give back', () => {
+    const d = consumedDeltas(
+      { slot: 2, itemUses: null, activityUses: null },
+      { slot: 2, itemUses: null, activityUses: null },
+      { spellLevel: 1, itemId: 'i1', activityId: 'a1' }
+    );
+    expect(d).toEqual({ actor: [], item: {} });
+  });
+});
+
+describe('midiSaveOptions: the save path asks for no reactions and no dialog', () => {
+  it('reactions off by default, the target given, damage rolled', () => {
+    const o = midiSaveOptions({});
+    expect(o.workflowOptions).toEqual({ targetConfirmation: 'none', noProvokeReaction: true });
+    expect(o.autoRollDamage).toBe('always');
+    expect(midiSaveOptions({ reactions: true }).workflowOptions.noProvokeReaction).toBeUndefined();
+  });
+});
+
+describe("round 4 (review S1): one effect of the caster's choice", () => {
+  const ef = (id: string, name: string, statuses: string[] = [], extra: any = {}) => ({
+    id,
+    uuid: `Item.i.ActiveEffect.${id}`,
+    name,
+    statuses: new Set(statuses),
+    transfer: false,
+    type: 'base',
+    flags: {},
+    ...extra,
+  });
+  const ed = (e: any, more: any = {}) => ({
+    _id: e.id,
+    effect: e,
+    onSave: false,
+    level: { min: null, max: null },
+    ...more,
+  });
+
+  it("the choices are Midi-QOL's own applicable list: no transfer, enchantment, on-save, wrong-level or caster's own effect", () => {
+    const act = {
+      relevantLevel: 3,
+      effects: [
+        ed(ef('a', 'Blindness', ['blinded'])),
+        ed(ef('b', 'Deafness', ['deafened'])),
+        ed(ef('c', 'Passive', [], { transfer: true })),
+        ed(ef('d', 'Enchant', [], { type: 'enchantment' })),
+        ed(ef('e', 'On a save'), { onSave: true }),
+        ed(ef('f', 'Upcast only'), { level: { min: 5, max: null } }),
+        ed(ef('g', 'Concentrating mark', [], { flags: { dae: { selfTarget: true } } })),
+        { _id: 'h', effect: null },
+      ],
+    };
+    expect(activityEffectChoices(act, 2).map(c => c.name)).toEqual(['Blindness', 'Deafness']);
+    expect(activityEffectChoices(act, 5).map(c => c.name)).toContain('Upcast only');
+    expect(activityEffectChoices(act).map(c => c.name)).toEqual(['Blindness', 'Deafness']);
+    expect(
+      itemEffectChoices([
+        ef('x', 'Hexed Strength'),
+        ef('y', 'Self', [], { flags: { dae: { selfTargetAlways: true } } }),
+      ]).map(c => c.name)
+    ).toEqual(['Hexed Strength']);
+  });
+
+  it('a named choice matches by name, then by the condition it gives, then by the one name that contains it', () => {
+    const choices = activityEffectChoices({
+      effects: [ed(ef('a', 'Blindness', ['blinded'])), ed(ef('b', 'Deafness', ['deafened']))],
+    });
+    expect(pickEffectChoice(choices, 'blindness').chosen?.name).toBe('Blindness');
+    expect(pickEffectChoice(choices, 'Deafened').chosen?.name).toBe('Deafness');
+    expect(pickEffectChoice(choices, 'deaf').chosen?.name).toBe('Deafness');
+    expect(pickEffectChoice(choices, '').problem).toBe('missing');
+    expect(pickEffectChoice(choices, undefined).problem).toBe('missing');
+    expect(pickEffectChoice(choices, 'charmed').problem).toBe('unknown');
+    expect(pickEffectChoice(choices, 'ness').problem).toBe('ambiguous');
+    expect(effectChoiceWords('Blindness/Deafness', choices, 'missing')).toMatch(
+      /choose one of Blindness, Deafness/
+    );
+  });
+
+  it("Midi's list is cut to the chosen effect; the caster's own effects stay", () => {
+    const a = ef('a', 'Hexed Strength');
+    const b = ef('b', 'Hexed Wisdom');
+    const self = ef('s', 'Hex (caster)', [], { flags: { dae: { selfTarget: true } } });
+    const chosen = itemEffectChoices([a, b])[1];
+    expect(keepChosenEffect([a, b, self], chosen).map(e => e.name)).toEqual([
+      'Hexed Wisdom',
+      'Hex (caster)',
+    ]);
+    // the same item's effect by id when Midi hands a copy with another uuid
+    expect(
+      keepChosenEffect([{ ...b, uuid: 'Scene.s.Token.t.Actor.x.Item.i.ActiveEffect.b' }], chosen)
+    ).toHaveLength(1);
   });
 });

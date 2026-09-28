@@ -77,6 +77,10 @@ let stuckDialogs: string[] = ['AttackRollConfigurationDialog'];
 // damage), and Midi refusing a use with more targets than this (its `requiresTargets` rule; 0 = off).
 let lateReactionMs = 0;
 let midiRefuseOver = 0;
+// Board #1887 (round 4): Midi-QOL's LATE formula target check (WorkflowState_AoETargetConfirmation): the cost is paid,
+// then the workflow is aborted and handed back (0 = off); and a notice some other add-on shows during a use.
+let midiAbortLateOver = 0;
+let otherToast = '';
 
 function getProperty(obj: any, path: string) {
   return path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
@@ -346,6 +350,23 @@ function install(toks: Tok[]) {
     },
   };
   g.foundry = { applications: { instances: openApps } };
+  // Foundry's Hooks, reduced: Midi-QOL 14.0.12 calls its per-state hooks with the workflow and awaits each
+  // (utils.ts asyncHooksCall), e.g. `midi-qol.preApplyDynamicEffects` before it applies an item's effects.
+  const hookFns = new Map<number, { name: string; fn: (...a: any[]) => any }>();
+  let hookId = 0;
+  g.Hooks = {
+    on(name: string, fn: (...a: any[]) => any) {
+      hookFns.set(++hookId, { name, fn });
+      return hookId;
+    },
+    off(name: string, id: number) {
+      if (hookFns.get(id)?.name === name) hookFns.delete(id);
+    },
+    async midiCall(name: string, w: any) {
+      for (const h of [...hookFns.values()]) if (h.name === name) await h.fn(w);
+    },
+    count: (name: string) => [...hookFns.values()].filter(h => h.name === name).length,
+  };
   const docOf = (o: any) => o?.document || o;
   const distance = (a: any, b: any, opts: any = {}) => {
     const A = docOf(a),
@@ -402,9 +423,10 @@ function install(toks: Tok[]) {
     if (typeof v === 'boolean') return v;
     return !!new Function(`return (${String(v)});`)();
   };
-  const stuck = (id: string, state: string, dialog?: string) => {
+  const stuck = (id: string, state: string, dialog?: string, sequenceId?: string) => {
     const w: any = {
       id,
+      sequenceId,
       activity: null,
       currentAction: { name: state },
       aborted: false,
@@ -452,6 +474,9 @@ function install(toks: Tok[]) {
       const mo = usage?.midiOptions ?? {};
       const wo = { ...mo, ...(mo.workflowOptions ?? {}) };
       midiCalls.push({ activity, usage, dialog });
+      // Midi-QOL's completeActivityUse tags the caller's own usage object (utils.ts: usage.sequenceId = randomID())
+      usage.sequenceId = `seq${midiCalls.length}`;
+      if (otherToast) g.ui.notifications.info(otherToast);
       const item = activity.item;
       const actor = item.parent;
       const attDoc = tokens.contents.find((t: any) => t.actor === actor);
@@ -463,7 +488,12 @@ function install(toks: Tok[]) {
         !wo.fastForwardAttack ||
         (item.system.properties?.has('thr') && !wo.attackMode);
       if (dialogForced) {
-        const w = stuck(wfId, 'WorkflowState_WaitForAttackRoll', 'AttackRollConfigurationDialog');
+        const w = stuck(
+          wfId,
+          'WorkflowState_WaitForAttackRoll',
+          'AttackRollConfigurationDialog',
+          usage.sequenceId
+        );
         w.activity = activity;
         return new Promise(() => {});
       }
@@ -471,8 +501,9 @@ function install(toks: Tok[]) {
       // Midi-QOL's own target count check (MidiActivityMixin.ts, `requiresTargets` on): a warning, no workflow, and
       // nothing spent (it runs before dnd5e's use).
       if (midiRefuseOver && targets.length > midiRefuseOver) {
+        // Midi-QOL 14.0.12's own text (lang/en.json, midi-qol.wrongNumberTargets)
         g.ui.notifications.warn(
-          `Wrong number of targets selected. You must select ${midiRefuseOver} target(s)`
+          `You must target at most ${midiRefuseOver} token(s) before rolling the attack`
         );
         return undefined;
       }
@@ -481,13 +512,77 @@ function install(toks: Tok[]) {
         const k = `system.spells.spell${item.system.level}.value`;
         setProperty(actor, k, Math.max(0, (getProperty(actor, k) ?? 0) - 1));
       }
-      // A save activity: Midi rolls the target's save (not modelled here) and ends.
-      if (activity.type === 'save')
+      // Midi-QOL's late formula count check: after the cost, a warning, and the ABORTED workflow handed back.
+      if (midiAbortLateOver && targets.length > midiAbortLateOver) {
+        g.ui.notifications.warn(
+          `You must target at most ${midiAbortLateOver} token(s) before rolling the attack`
+        );
         return {
-          currentAction: { name: 'WorkflowState_Cleanup' },
+          aborted: true,
+          currentAction: { name: 'WorkflowState_Abort' },
+          attackRoll: null,
+          sequenceId: usage.sequenceId,
+        };
+      }
+      // An AREA save activity (a breath weapon's line): dnd5e places a template unless the usage says not to (then it
+      // waits for a click for ever); with none placed Midi suspends in WorkflowState_AwaitTemplate until it is told the
+      // use is complete (unSuspend({itemUseComplete: true})), then goes on with the targets given.
+      if (activity.type === 'save' && activity.target?.template?.type) {
+        if (usage.create?.measuredTemplate !== false) return new Promise(() => {});
+        const w: any = {
+          id: wfId,
+          sequenceId: usage.sequenceId,
+          activity,
+          suspended: true,
+          templateUuids: [],
+          currentAction: { name: 'WorkflowState_AwaitTemplate' },
+          aborted: false,
+          WorkflowState_Abort: { name: 'WorkflowState_Abort' },
+          async performState(st: any) {
+            w.currentAction = st;
+          },
+        };
+        liveWorkflows.set(wfId, w);
+        return new Promise(resolve => {
+          w.unSuspend = async (ctx: any) => {
+            if (!ctx?.itemUseComplete) return;
+            w.suspended = false;
+            for (const tg of targets) docOf(tg).actor.system.attributes.hp.value -= 7;
+            w.currentAction = { name: 'WorkflowState_Completed' };
+            resolve(w);
+          };
+        });
+      }
+      // A save activity: Midi rolls the target's save (not modelled here: every target fails) and applies the item's
+      // effects (Workflow.ts WorkflowState_ApplyDynamicEffects 2651-2672, autoItemEffects on): EVERY effect the activity
+      // lists, unless its midiProperties.chooseEffects is on; then Midi's chooseEffects asks in a DialogV2 that nobody
+      // in the headless GM browser answers. Its pre-state hook runs first, with the workflow.
+      if (activity.type === 'save') {
+        const w: any = {
+          id: wfId,
+          sequenceId: usage.sequenceId,
+          activity,
+          currentAction: { name: 'WorkflowState_ApplyDynamicEffects' },
           aborted: false,
           attackRoll: null,
+          chooseEffects(_effects: any[]) {
+            openApps.set('DialogV2', { constructor: { name: 'DialogV2' }, close: async () => {} });
+            return new Promise(() => {});
+          },
         };
+        const listed = (activity.effects ?? []).filter(
+          (ed: any) => ed.effect && ed.onSave !== true
+        );
+        if (listed.length && midiConfig.autoItemEffects !== 'off') {
+          await g.Hooks.midiCall('midi-qol.preApplyDynamicEffects', w);
+          let effs = listed.map((ed: any) => ed.effect);
+          if (w.activity.midiProperties?.chooseEffects) effs = await w.chooseEffects(effs);
+          for (const tg of targets)
+            for (const ef of effs) docOf(tg).actor.effects.push({ name: ef.name });
+        }
+        w.currentAction = { name: 'WorkflowState_Cleanup' };
+        return w;
+      }
       if (midiDelayMs) await new Promise(r => setTimeout(r, midiDelayMs));
       // ValidateRoll: Midi's own range check.
       const rv = rangeVerdict(activity, attDoc.object, targets);
@@ -548,11 +643,15 @@ function install(toks: Tok[]) {
         const hit = Number.isFinite(ac) && (crit || (!fumble && roll.total >= ac));
         // reactions: without DAE, a reaction prompt crashes the workflow (doReactions).
         if (hit && tDoc.actor.reactions?.length && !wo.noProvokeReaction && lateReactionMs) {
-          // WITH DAE: the prompt waits (nobody answers), then Midi's own state loop goes on to the state it was handed,
-          // read from the workflow object (Workflow.ts: `return this.WorkflowState_AllRollsComplete`), and
-          // AllRollsComplete applies the damage with no abort check.
-          const w = stuck(wfId, 'WorkflowState_AttackRollComplete');
+          // WITH DAE, the path the re-review named: the workflow is inside WaitForSaves (waiting, here on the reaction),
+          // and leaves by an EARLY exit (Workflow.ts 2315 to 2327 or 2340), handing over SavesComplete, which hands over
+          // AllRollsComplete, which applies the damage with no abort check. Midi's loop reads each next state from the
+          // workflow object (`return this.WorkflowState_X`) and runs it while aborting (performState).
+          const w = stuck(wfId, 'WorkflowState_WaitForSaves', undefined, usage.sequenceId);
           w.activity = activity;
+          w.WorkflowState_SavesComplete = async function (this: any) {
+            return this.WorkflowState_AllRollsComplete;
+          };
           w.WorkflowState_AllRollsComplete = async function (this: any) {
             tDoc.actor.system.attributes.hp.value -= 5;
             return this.WorkflowState_Cleanup;
@@ -560,14 +659,15 @@ function install(toks: Tok[]) {
           w.WorkflowState_Cleanup = { name: 'WorkflowState_Cleanup' };
           return new Promise(resolve => {
             setTimeout(async () => {
-              const next = w.WorkflowState_AllRollsComplete;
-              await next.call(w);
+              // the early exit of WaitForSaves, then Midi's loop: run each state it is handed
+              let next: any = w.WorkflowState_SavesComplete;
+              for (let i = 0; i < 5 && typeof next === 'function'; i++) next = await next.call(w);
               resolve(w);
             }, lateReactionMs);
           });
         }
         if (hit && tDoc.actor.reactions?.length && !wo.noProvokeReaction) {
-          const w = stuck(wfId, 'WorkflowState_AttackRollComplete');
+          const w = stuck(wfId, 'WorkflowState_AttackRollComplete', undefined, usage.sequenceId);
           w.activity = activity;
           return new Promise(() => {});
         }
@@ -699,6 +799,8 @@ beforeEach(() => {
   stuckDialogs = ['AttackRollConfigurationDialog'];
   lateReactionMs = 0;
   midiRefuseOver = 0;
+  midiAbortLateOver = 0;
+  otherToast = '';
 });
 
 describe("bridge 0.10.8: the attack is Midi-QOL's own workflow (engine map M07)", () => {
@@ -1833,7 +1935,9 @@ describe("Midi-QOL refuses the use itself (its target count rule): a refusal in 
     for (const r of res.results) {
       expect(r.engineRefused).toBe(true);
       expect(r.hit).toBe(false);
-      expect(r.note).toMatch(/^Midi-QOL did not make the attack: Wrong number of targets/);
+      expect(r.note).toMatch(
+        /^Midi-QOL did not make the attack: You must target at most 1 token\(s\)/
+      );
     }
   });
 
@@ -1867,7 +1971,7 @@ describe("Midi-QOL refuses the use itself (its target count rule): a refusal in 
     for (const r of res.results) {
       expect(r.via).toBe('save');
       expect(r.engineRefused).toBe(true);
-      expect(r.note).toMatch(/^Midi-QOL did not cast it: Wrong number of targets/);
+      expect(r.note).toMatch(/^Midi-QOL did not cast it: You must target at most 1 token\(s\)/);
     }
   });
 
@@ -1881,5 +1985,501 @@ describe("Midi-QOL refuses the use itself (its target count rule): a refusal in 
     expect(res.success).toBe(true);
     expect(res.refused).toBeUndefined();
     expect(kobold.system.spells.spell1.value).toBe(1);
+  });
+});
+
+// ================================================================================================
+// Board #1887 (bridge 0.10.8 round 4): the re-review of d7f62a6
+// ================================================================================================
+
+// dnd5e 5.3.3's own cost check on a fake activity: `_prepareUsageUpdates(config, {returnErrors: true})` hands back its
+// ConsumptionErrors, or the updates when the cost can be paid.
+function withCost(act: any, errors: string[]) {
+  act._prepareUsageConfig = (c: any) => ({ ...c, consume: { resources: [0] } });
+  act._prepareUsageUpdates = async (_c: any, o: any) =>
+    errors.length && o?.returnErrors ? errors.map(m => ({ message: m })) : { actor: {}, item: [] };
+}
+// dnd5e 5.3.3's own refund: each actor row's value gives back its delta (value = current - delta).
+function withRefund(act: any, actor: any) {
+  act.refund = async (consumed: any) => {
+    for (const { keyPath, delta } of consumed.actor ?? [])
+      setProperty(actor, keyPath, (getProperty(actor, keyPath) ?? 0) - delta);
+  };
+}
+function saveSpell(name: string, level = 1) {
+  const sp = makeWeapon({
+    name,
+    type: 'spell',
+    quantity: 1,
+    level,
+    range: { value: 60, long: null, units: 'ft' },
+    properties: [],
+    attackModes: [],
+    actionType: 'save',
+  });
+  const act = sp.system.activities.contents[0];
+  act.type = 'save';
+  delete act.attack;
+  act.save = {};
+  return { sp, act };
+}
+
+describe("round 4: what the ENGINE would refuse is asked before the use, in the engine's words", () => {
+  it("a cost dnd5e cannot pay (a Recharge not recharged): refused in dnd5e's words, Midi never asked", async () => {
+    const bolt = levelledSpell('Fire Bolt Recharge', 0);
+    withCost(bolt.system.activities.contents[0], [
+      'No uses on Fire Bolt Recharge available to spend, 1 required.',
+    ]);
+    bolt.system.activities.contents[0].uses = { max: 1, value: 0 };
+    world({ targetFeet: 30, dagger: bolt, attackerItems: [bolt] });
+    const res = await attack('Fire Bolt Recharge');
+    expect(midiCalls).toHaveLength(0);
+    expect(res.success).toBe(false);
+    expect(res.refused).toBe(true);
+    expect(res.results[0].refusedBy).toBe('dnd5e');
+    expect(res.results[0].note).toBe(
+      'Fire Bolt Recharge was not used: No uses on Fire Bolt Recharge available to spend, 1 required.'
+    );
+  });
+
+  it('the same on the SAVE path (a breath weapon used up for the day)', async () => {
+    const { sp, act } = saveSpell('Fire Breath', 0);
+    withCost(act, ['No uses on Fire Breath available to spend, 1 required.']);
+    world({ targetFeet: 30, dagger: sp, attackerItems: [sp] });
+    const res = await attack('Fire Breath');
+    expect(midiCalls).toHaveLength(0);
+    expect(res.refused).toBe(true);
+    expect(res.results[0].via).toBe('save');
+    expect(res.results[0].note).toMatch(/^Fire Breath was not used: No uses on Fire Breath/);
+  });
+
+  it('guard: a cost dnd5e can pay is used as before', async () => {
+    const { sp, act } = saveSpell('Fire Breath', 0);
+    withCost(act, []);
+    world({ targetFeet: 30, dagger: sp, attackerItems: [sp] });
+    const res = await attack('Fire Breath');
+    expect(midiCalls).toHaveLength(1);
+    expect(res.success).toBe(true);
+  });
+
+  it('a formula target count (Hold Person at level 2 takes 1): refused before the use, no slot spent', async () => {
+    const { sp, act } = saveSpell('Hold Person', 2);
+    act.target = { affects: { count: 1 } }; // dnd5e's evaluated "@item.level - 1"
+    const { kobold } = world({
+      targetFeet: 30,
+      dagger: sp,
+      attackerItems: [sp],
+      extraTokens: [nimAt(8)],
+    });
+    kobold.system.spells = { spell2: { value: 2, max: 2 } };
+    const res = await attack('Hold Person', ['brakka', 'nim']);
+    expect(midiCalls).toHaveLength(0);
+    expect(kobold.system.spells.spell2.value).toBe(2);
+    expect(res.refused).toBe(true);
+    expect(res.results.map((r: any) => r.note)).toEqual([
+      'Hold Person was not used: You must target at most 1 token(s) before rolling the attack',
+      'Hold Person was not used: You must target at most 1 token(s) before rolling the attack',
+    ]);
+  });
+
+  it('the heal path (never runs Midi): Cure Wounds (1 target) at three targets is refused, nobody healed', async () => {
+    const cure = makeWeapon({
+      name: 'Cure Wounds',
+      type: 'spell',
+      quantity: 1,
+      level: 1,
+      range: { value: 30, long: null, units: 'ft' },
+      properties: [],
+      attackModes: [],
+      actionType: 'heal',
+    });
+    const act = cure.system.activities.contents[0];
+    act.type = 'heal';
+    delete act.attack;
+    act.target = { affects: { count: 1 } };
+    const hurt = makeActor('Brakka', [], 20, 16);
+    hurt.system.attributes.hp.value = 5;
+    const { kobold } = world({
+      targetFeet: 5,
+      dagger: cure,
+      attackerItems: [cure],
+      target: hurt,
+      extraTokens: [nimAt(1, 1)],
+    });
+    kobold.system.spells = { spell1: { value: 2, max: 2 } };
+    const res = await attack('Cure Wounds', ['brakka', 'nim', 'kobold']);
+    expect(res.refused).toBe(true);
+    expect(kobold.system.spells.spell1.value).toBe(2);
+    expect(hurt.system.attributes.hp.value).toBe(5);
+    expect(res.results.every((r: any) => r.via === 'heal' && r.engineRefused)).toBe(true);
+  });
+
+  it('a plain damage activity through Midi (Magic Missile, 2 + level darts) at four targets: refused, no slot spent', async () => {
+    const mm = makeWeapon({
+      name: 'Magic Missile',
+      type: 'spell',
+      quantity: 1,
+      level: 1,
+      range: { value: 120, long: null, units: 'ft' },
+      properties: [],
+      attackModes: [],
+      actionType: 'other',
+    });
+    const act = mm.system.activities.contents[0];
+    act.type = 'damage';
+    delete act.attack;
+    act.target = { affects: { count: 3 } }; // dnd5e's evaluated "2 + @item.level"
+    const { kobold } = world({
+      targetFeet: 30,
+      dagger: mm,
+      attackerItems: [mm],
+      extraTokens: [
+        nimAt(8),
+        { ...nimAt(9), id: 'orc', name: 'Orc', actor: makeActor('Orc', [], 15, 13) },
+        { ...nimAt(10), id: 'elf', name: 'Elf', actor: makeActor('Elf', [], 15, 13) },
+      ],
+    });
+    kobold.system.spells = { spell1: { value: 2, max: 2 } };
+    const res = await attack('Magic Missile', ['brakka', 'nim', 'orc', 'elf']);
+    expect(midiCalls).toHaveLength(0);
+    expect(kobold.system.spells.spell1.value).toBe(2);
+    expect(res.refused).toBe(true);
+    expect(res.results[0].note).toBe(
+      'Magic Missile was not used: You must target at most 3 token(s) before rolling the attack'
+    );
+    // the row names the path the call would have taken (Midi's save and damage path), never 'attack'
+    expect(res.results[0].via).toBe('save');
+  });
+
+  it('guard: a weapon at two targets is two attacks, never refused by the one-target count', async () => {
+    const club = makeWeapon({
+      name: 'Club',
+      quantity: 1,
+      range: { value: null, long: null, reach: 5 },
+      properties: ['lgt'],
+      attackModes: [{ value: 'oneHanded' }],
+    });
+    club.system.activities.contents[0].target = { affects: { count: 1 } };
+    world({ targetFeet: 5, dagger: club, attackerItems: [club], extraTokens: [nimAt(1, 1)] });
+    const res = await attack('Club', ['brakka', 'nim']);
+    expect(midiCalls).toHaveLength(2);
+    expect(res.refused).toBeUndefined();
+  });
+
+  it("Midi-QOL refusing AFTER the cost (its late formula check): said in Midi's words, and dnd5e's refund gives the slot back", async () => {
+    midiAbortLateOver = 1;
+    const bolt = levelledSpell('Guiding Bolt');
+    const { kobold } = world({
+      targetFeet: 30,
+      dagger: bolt,
+      attackerItems: [bolt],
+      extraTokens: [nimAt(8)],
+    });
+    withRefund(bolt.system.activities.contents[0], kobold);
+    kobold.system.spells = { spell1: { value: 2, max: 2 } };
+    const res = await attack('Guiding Bolt', ['brakka', 'nim']);
+    expect(midiCalls).toHaveLength(1);
+    expect(res.refused).toBe(true);
+    expect(kobold.system.spells.spell1.value).toBe(2);
+    for (const r of res.results) {
+      expect(r.engineRefused).toBe(true);
+      expect(r.refunded).toBe('a spell slot');
+      expect(r.note).toBe(
+        'Midi-QOL did not make the attack: You must target at most 1 token(s) before rolling the attack'
+      );
+    }
+  });
+
+  it('the same late refusal on the SAVE path gives the slot back too', async () => {
+    midiAbortLateOver = 1;
+    const { sp, act } = saveSpell('Hold Person', 2);
+    const { kobold } = world({
+      targetFeet: 30,
+      dagger: sp,
+      attackerItems: [sp],
+      extraTokens: [nimAt(8)],
+    });
+    withRefund(act, kobold);
+    kobold.system.spells = { spell2: { value: 2, max: 2 } };
+    const res = await attack('Hold Person', ['brakka', 'nim']);
+    expect(res.refused).toBe(true);
+    expect(kobold.system.spells.spell2.value).toBe(2);
+    expect(res.results[0].refunded).toBe('a spell slot');
+  });
+
+  it('only Midi-QOL\'s own refusal text counts: another add-on\'s notice is a note, never "the reason"', async () => {
+    midiRefuseOver = 1;
+    otherToast = 'Some add-on says hello';
+    const bolt = levelledSpell('Guiding Bolt');
+    const { kobold } = world({
+      targetFeet: 30,
+      dagger: bolt,
+      attackerItems: [bolt],
+      extraTokens: [nimAt(8)],
+    });
+    kobold.system.spells = { spell1: { value: 2, max: 2 } };
+    const res = await attack('Guiding Bolt', ['brakka', 'nim']);
+    expect(res.results[0].note).toBe(
+      'Midi-QOL did not make the attack: You must target at most 1 token(s) before rolling the attack'
+    );
+    expect(res.results[0].engineNotes).toContain('Some add-on says hello');
+  });
+
+  it('a notice with no Midi refusal and no workflow is an error, not a refusal', async () => {
+    otherToast = 'Some add-on says hello';
+    midiThrows.completeActivityUse = false;
+    const bolt = levelledSpell('Guiding Bolt');
+    const { kobold } = world({ targetFeet: 30, dagger: bolt, attackerItems: [bolt] });
+    kobold.system.spells = { spell1: { value: 2, max: 2 } };
+    const h = new QueryHandlers() as any;
+    h.midiAttackTimeoutMs = 60;
+    (globalThis as any).MidiQOL.completeActivityUse = async (_a: any, usage: any) => {
+      usage.sequenceId = 'seqX';
+      (globalThis as any).ui.notifications.info('Some add-on says hello');
+      return undefined;
+    };
+    const res = await h.handleExecuteAttack({
+      attacker: 'kobold',
+      item: 'Guiding Bolt',
+      targets: ['brakka'],
+    });
+    expect(res.results[0].engineRefused).toBeUndefined();
+    expect(res.results[0].error).toMatch(/gave nothing back/);
+  });
+});
+
+describe('round 4: the SAVE path runs like the attack path', () => {
+  it('no reactions and no target dialog are asked of Midi on a save (operator "With the chooser")', async () => {
+    const { sp } = saveSpell('Sacred Flame', 0);
+    world({ targetFeet: 30, dagger: sp, attackerItems: [sp] });
+    await attack('Sacred Flame');
+    expect(midiCalls[0].usage.midiOptions.workflowOptions).toMatchObject({
+      noProvokeReaction: true,
+      targetConfirmation: 'none',
+    });
+  });
+
+  it("a save stuck in a dialog is stopped within the call, the dialog closed, never Midi's own 90 s", async () => {
+    const { sp, act } = saveSpell('Fire Breath', 0);
+    act.midiProperties = { forceRollDialog: 'always' };
+    world({ targetFeet: 30, dagger: sp, attackerItems: [sp] });
+    const t0 = Date.now();
+    const res = await attack('Fire Breath');
+    expect(Date.now() - t0).toBeLessThan(1500);
+    expect(res.results[0].error).toMatch(/did not finish within/);
+    expect(openApps.size).toBe(0);
+    expect(res.success).toBe(false);
+  }, 3000);
+
+  it('a finished save that changes no hit points (Hold Person) answers at once, with no 2 s hit-point wait', async () => {
+    const { sp } = saveSpell('Hold Person', 2);
+    const { kobold } = world({ targetFeet: 30, dagger: sp, attackerItems: [sp] });
+    kobold.system.spells = { spell2: { value: 2, max: 2 } };
+    const t0 = Date.now();
+    const res = await attack('Hold Person');
+    expect(res.success).toBe(true);
+    // Midi's workflow came back finished, so its damage (none here) is already applied: nothing to wait for
+    expect(Date.now() - t0).toBeLessThan(1000);
+  }, 5000);
+});
+
+describe('round 4: stopping picks THIS use by its sequence id, and says it guarded it', () => {
+  it('another running use of the same item is left alone', async () => {
+    const knight = makeActor('Brakka', [], 20, 16, {}, { reactions: ['Parry'] });
+    world({ targetFeet: 5, target: knight });
+    // a workflow of another use of the same Dagger, already running (another sequence id)
+    const other: any = {
+      id: 'wfOther',
+      sequenceId: 'seqOther',
+      activity: null,
+      currentAction: { name: 'WorkflowState_WaitForDamageRoll' },
+      aborted: false,
+      async performState() {
+        other.abortedByBridge = true;
+      },
+      WorkflowState_Abort: { name: 'WorkflowState_Abort' },
+    };
+    d20Queue = [15, 15];
+    const res = await attack('Dagger', ['brakka'], undefined, { reactions: true });
+    other.activity = midiCalls[0].activity;
+    liveWorkflows.set('wfOther', other);
+    expect(res.results[0].error).toMatch(/did not finish/);
+    // the stuck use (seq1) was stopped; a second call must not touch seqOther
+    const res2 = await attack('Dagger', ['brakka'], undefined, { reactions: true });
+    expect(res2.results[0].error).toMatch(/did not finish/);
+    expect(other.abortedByBridge).toBeUndefined();
+  });
+
+  it('the answer says when a stopped workflow was guarded against late damage', async () => {
+    const knight = makeActor('Brakka', [], 20, 16, {}, { reactions: ['Parry'] });
+    world({ targetFeet: 5, target: knight });
+    d20Queue = [15];
+    lateReactionMs = 150;
+    const res = await attack('Dagger', ['brakka'], undefined, { reactions: true });
+    expect(res.results[0].guardedAfterStop).toBe(true);
+  });
+});
+
+describe('round 4: a row for a target that was not attacked shows its hit points NOW', () => {
+  it('a target named twice, the second not attacked for lack of time: it starts from what the first left', async () => {
+    world({ targetFeet: 5, dagger: makeDagger(2) });
+    d20Queue = [15, 15];
+    midiDelayMs = 150;
+    const h = new QueryHandlers() as any;
+    h.midiAttackTimeoutMs = 1000;
+    h.midiCallBudgetMs = 250;
+    h.midiDeadlineMarginMs = 20;
+    h.midiMinRunMs = 100;
+    const res = await h.handleExecuteAttack({
+      attacker: 'kobold',
+      item: 'Dagger',
+      targets: ['brakka', 'brakka'],
+    });
+    const [a, b] = res.results;
+    expect(a.hpAfter).toBeLessThan(20);
+    expect(b.error).toMatch(/^not attacked: no time was left/);
+    expect(b.hpBefore).toBe(a.hpAfter);
+  });
+});
+
+describe('round 4: an area activity (a breath weapon) never waits for a template placement', () => {
+  it('no template is placed, Midi is told the use is complete, and the named target takes the damage', async () => {
+    const { sp, act } = saveSpell('Fire Breath', 0);
+    act.target = { template: { type: 'line', size: 15 }, affects: {} };
+    const { brakka } = world({ targetFeet: 10, dagger: sp, attackerItems: [sp] });
+    const res = await attackWith(h => (h.midiAttackTimeoutMs = 2000), 'Fire Breath', ['brakka']);
+    expect(midiCalls[0].usage.create).toEqual({ measuredTemplate: false });
+    expect(res.success).toBe(true);
+    expect(res.results[0].templateNotPlaced).toBe(true);
+    expect(brakka.system.attributes.hp.value).toBe(13);
+  });
+});
+
+// Board #1887 (bridge 0.10.8 round 4, review S1): with autoItemEffects on, Midi-QOL applies EVERY effect an activity
+// lists (chooseEffects defaults to false): Blindness/Deafness gave blinded AND deafened, Hex all six. The rules say the
+// caster chooses ONE; the call names it (effect) and only that one is applied.
+function effectOf(itemId: string, id: string, name: string, statuses: string[] = []) {
+  return {
+    id,
+    uuid: `Item.${itemId}.ActiveEffect.${id}`,
+    name,
+    statuses: new Set(statuses),
+    transfer: false,
+    type: 'base',
+    flags: {},
+    toObject() {
+      return { _id: id, name, statuses, transfer: false };
+    },
+  };
+}
+function choiceSpell(
+  name: string,
+  level: number,
+  effects: [string, string, string[]][],
+  type = 'save'
+) {
+  const { sp, act } = saveSpell(name, level);
+  const efs = effects.map(([id, n, st]) => effectOf(sp.id, id, n, st));
+  sp.effects = efs;
+  act.effects = efs.map(ef => ({
+    _id: ef.id,
+    effect: ef,
+    onSave: false,
+    level: { min: null, max: null },
+  }));
+  if (type !== 'save') {
+    act.type = type;
+    delete act.save;
+  }
+  return { sp, act, efs };
+}
+const BLIND_DEAF: [string, string, string[]][] = [
+  ['eBlind', 'Blindness', ['blinded']],
+  ['eDeaf', 'Deafness', ['deafened']],
+];
+
+describe("round 4: an activity that puts ONE effect of the caster's choice applies only the one chosen", () => {
+  it('Blindness/Deafness choosing "blinded": only Blindness lands, and Midi never asks in a dialog', async () => {
+    const { sp, act } = choiceSpell('Blindness/Deafness', 2, BLIND_DEAF);
+    const { kobold, brakka } = world({ targetFeet: 30, dagger: sp, attackerItems: [sp] });
+    kobold.system.spells = { spell2: { value: 2, max: 2 } };
+    const res = await attack('Blindness/Deafness', ['brakka'], undefined, { effect: 'blinded' });
+    expect(res.success).toBe(true);
+    expect(brakka.effects.map((e: any) => e.name)).toEqual(['Blindness']);
+    expect(res.results[0].effectChosen).toBe('Blindness');
+    expect(openApps.size).toBe(0);
+    // Midi's switch is put back and the hook removed: the item is as it was
+    expect(act.midiProperties.chooseEffects).toBeFalsy();
+    expect((globalThis as any).Hooks.count('midi-qol.preApplyDynamicEffects')).toBe(0);
+  });
+
+  it('no effect named: nothing is used, nothing spent, and the answer lists the choices', async () => {
+    const { sp } = choiceSpell('Blindness/Deafness', 2, BLIND_DEAF);
+    const { kobold, brakka } = world({ targetFeet: 30, dagger: sp, attackerItems: [sp] });
+    kobold.system.spells = { spell2: { value: 2, max: 2 } };
+    const res = await attack('Blindness/Deafness');
+    expect(midiCalls).toHaveLength(0);
+    expect(kobold.system.spells.spell2.value).toBe(2);
+    expect(brakka.effects).toEqual([]);
+    expect(res.refused).toBe(true);
+    expect(res.results[0]).toMatchObject({
+      needsChoice: true,
+      refusedBy: 'rules',
+      effectChoices: ['Blindness', 'Deafness'],
+    });
+    expect(res.results[0].note).toMatch(/choose one of Blindness, Deafness/);
+  });
+
+  it('a choice the spell does not offer is refused the same way, the choices listed', async () => {
+    const { sp } = choiceSpell('Blindness/Deafness', 2, BLIND_DEAF);
+    const { kobold } = world({ targetFeet: 30, dagger: sp, attackerItems: [sp] });
+    kobold.system.spells = { spell2: { value: 2, max: 2 } };
+    const res = await attack('Blindness/Deafness', ['brakka'], undefined, { effect: 'Charmed' });
+    expect(midiCalls).toHaveLength(0);
+    expect(res.results[0].effectChoices).toEqual(['Blindness', 'Deafness']);
+    expect(res.results[0].note).toMatch(/has no effect "Charmed"/);
+  });
+
+  it('guard: an activity with ONE effect (Hold Person) needs no choice and applies it as before', async () => {
+    const { sp } = choiceSpell('Hold Person', 2, [['ePar', 'Paralyzed', ['paralyzed']]]);
+    const { kobold, brakka } = world({ targetFeet: 30, dagger: sp, attackerItems: [sp] });
+    kobold.system.spells = { spell2: { value: 2, max: 2 } };
+    const res = await attack('Hold Person');
+    expect(res.success).toBe(true);
+    expect(brakka.effects.map((e: any) => e.name)).toEqual(['Paralyzed']);
+    expect(res.results[0].effectChosen).toBeUndefined();
+  });
+
+  it("guard: with Midi-QOL's autoItemEffects off (Midi applies no effects) no choice is asked", async () => {
+    const { sp } = choiceSpell('Blindness/Deafness', 2, BLIND_DEAF);
+    const { kobold, brakka } = world({ targetFeet: 30, dagger: sp, attackerItems: [sp] });
+    midiConfig.autoItemEffects = 'off';
+    kobold.system.spells = { spell2: { value: 2, max: 2 } };
+    const res = await attack('Blindness/Deafness');
+    expect(res.success).toBe(true);
+    expect(brakka.effects).toEqual([]);
+  });
+
+  it('Hex on the buff path (a utility activity, the bridge applies it): "strength" puts only Hexed Strength on', async () => {
+    const six = ['Strength', 'Dexterity', 'Constitution', 'Intelligence', 'Wisdom', 'Charisma'].map(
+      (a): [string, string, string[]] => ['e' + a.slice(0, 3), 'Hexed ' + a, ['cursed']]
+    );
+    const { sp } = choiceSpell('Hex', 1, six, 'utility');
+    const { kobold, brakka } = world({ targetFeet: 30, dagger: sp, attackerItems: [sp] });
+    kobold.system.spells = { spell1: { value: 2, max: 2 } };
+    brakka.createEmbeddedDocuments = async (_t: string, docs: any[]) => {
+      const made = docs.map(d => ({ ...d, id: d.name }));
+      brakka.effects.push(...made);
+      return made;
+    };
+    brakka.deleteEmbeddedDocuments = async () => [];
+    const none = await attack('Hex');
+    expect(none.refused).toBe(true);
+    expect(none.results[0].effectChoices).toHaveLength(6);
+    expect(brakka.effects).toEqual([]);
+    const res = await attack('Hex', ['brakka'], undefined, { effect: 'strength' });
+    expect(res.success).toBe(true);
+    expect(brakka.effects.map((e: any) => e.name)).toEqual(['Hexed Strength']);
+    expect(res.results[0].effectChosen).toBe('Hexed Strength');
   });
 });

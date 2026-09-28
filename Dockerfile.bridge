@@ -1,4 +1,6 @@
-FROM node:20-slim
+# Board #1887 (bridge 0.10.8 round 4, operator-approved Trivy review): Node 20 is end of life; Node 24 is the current
+# LTS. The repo is built and tested with the same Node (node:24) before it is copied in; build with --pull.
+FROM node:24-slim
 WORKDIR /app
 # built repo (dist + hoisted node_modules) copied in; ComfyUI intentionally absent (map-gen
 # tools inert for v1 — auto-start is non-fatal). Brain talks HTTP (MCP_HTTP_PORT); the Foundry

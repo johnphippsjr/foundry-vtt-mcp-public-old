@@ -100,6 +100,11 @@ export class CombatTools {
               items: { type: 'string' },
               description: 'Target token name(s) or id(s).',
             },
+            // Board #1887 (bridge 0.10.8 round 4, review S1): the rules say the caster chooses ONE effect.
+            effect: {
+              type: 'string',
+              description: `Only when the spell or ability puts ONE effect of the caster's choice on its target (Blindness/Deafness: "Blindness" or "Deafness"; Hex or Bestow Curse: the ability, e.g. "Strength"; Enlarge/Reduce: "Enlarged" or "Reduced"): the one chosen (the monster's choice, or what the player said). A condition name works too ("blinded"). When a choice is needed and none is named, nothing is used and the answer lists the choices (effectChoices).`,
+            },
           },
           required: ['attacker', 'item', 'targets'],
         },
@@ -131,6 +136,8 @@ export class CombatTools {
         item: args?.item,
         targets: args?.targets || [],
         ...(args?.itemId ? { itemId: args.itemId } : {}),
+        // Board #1887 (round 4, review S1): the caster's one chosen effect, when the activity offers a choice.
+        ...(args?.effect ? { effect: String(args.effect) } : {}),
         // Board #1887 (round 3, operator popup "With the chooser"): reactions stay OFF until the aidm-rules reaction
         // chooser exists; the model is not offered them and cannot pass them (the add-on's handler keeps the switch).
       })

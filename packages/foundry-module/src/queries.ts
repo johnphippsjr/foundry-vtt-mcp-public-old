@@ -36,10 +36,6 @@ import {
   type CombatToken,
 } from './combat-scoping-utils.js';
 import { staleCombatIdsToDelete } from './combat-cleanup-utils.js';
-
-/** Board #1887 (round 3): execute-attack's default for Midi-QOL's per-call Dice So Nice switches (see
- * QueryHandlers#midiSkipDiceAnimation). */
-const SKIP_DICE_DEFAULT = false;
 import { AidmModuleHandlers } from './aidm-module-handlers.js';
 import {
   chooseAttackMode,
@@ -55,9 +51,26 @@ import {
   activitySpendsOnUse,
   spentOnUse,
   guardStoppedWorkflow,
+  engineTargetCount,
+  wrongNumberTargetsWords,
+  isMidiRefusalText,
+  usageCostErrors,
+  consumedDeltas,
+  midiSaveOptions,
+  activityEffectChoices,
+  itemEffectChoices,
+  pickEffectChoice,
+  effectChoiceWords,
+  keepChosenEffect,
+  type EffectChoice,
   MIDI_DEADLINE_MARGIN_MS,
   MIDI_MIN_RUN_MS,
 } from './attack-rules-utils.js';
+
+/** Board #1887 (round 3): execute-attack's default for Midi-QOL's per-call Dice So Nice switches (see
+ * QueryHandlers#midiSkipDiceAnimation). Off: the operator chose "Fast, no robot dice" (2026-09-28); the robot GM's own
+ * 3D dice are off in every world (gmhost 0.4.13), so Midi does not wait for them anyway. */
+const SKIP_DICE_DEFAULT = false;
 
 // Board #1714 review: adventure-import and adventure-source-backfill apply both plan from live
 // state and then write. This module-level lock makes those calls run one at a time INSIDE THIS ONE
@@ -2523,10 +2536,18 @@ export class QueryHandlers {
     targets: string[];
     itemId?: string;
     reactions?: boolean;
+    /** Board #1887 (round 4): the one effect the caster chose, when the activity offers a choice (Hex: "Strength"). */
+    effect?: string;
   }): Promise<any> {
     const gm = this.validateGMAccess();
     if (!gm.allowed) return { error: 'Access denied', success: false };
     const callDeadline = Date.now() + this.midiCallBudgetMs;
+    // The time one Midi run may take: its own limit, and never past the whole call's deadline (round 4: the save path
+    // too).
+    const timeLeft = () => callDeadline - Date.now() - this.midiDeadlineMarginMs;
+    const runBudget = () => Math.min(this.midiAttackTimeoutMs, timeLeft());
+    const noTime =
+      'no time was left in this call (the MCP side waits 60 s for the whole call), so it was not started';
     const MidiQOL = (globalThis as any).MidiQOL;
     if (!MidiQOL) throw new Error('MidiQOL not available');
     const scene = this._activeScene();
@@ -2596,6 +2617,45 @@ export class QueryHandlers {
         await actor.update({
           ['system.spells.spell' + spellLevel + '.value']: Math.max(0, (s.value || 0) - 1),
         });
+      }
+    };
+
+    // What a use spends, read before and after a Midi run (said when a stopped use still spent it; given back with
+    // dnd5e's own refund when Midi-QOL refused the use after paying for it).
+    const _spendNow = () => ({
+      slot: spellLevel > 0 ? (actor.system?.spells?.[`spell${spellLevel}`]?.value ?? null) : null,
+      itemUses: item.system?.uses?.value ?? null,
+      activityUses: activity.uses?.value ?? null,
+    });
+    const _hpNow = (t: any) => t.actor?.system?.attributes?.hp?.value ?? 0;
+    // Board #1887 (round 4): Midi-QOL refused a use AFTER paying for it (its formula target count, checked late):
+    // dnd5e's own refund gives back exactly what the readings show was spent. Returns the words, or null.
+    const refundIfSpent = async (spend0: any): Promise<string | null> => {
+      const spent = spentOnUse(spend0, _spendNow());
+      if (!spent.any) return null;
+      try {
+        const consumed = consumedDeltas(spend0, _spendNow(), {
+          spellLevel,
+          itemId: item.id ?? null,
+          activityId: activity.id ?? null,
+        });
+        if (typeof activity.refund !== 'function') throw new Error('dnd5e has no refund');
+        await activity.refund(consumed);
+        const left = spentOnUse(spend0, _spendNow());
+        if (left.any) {
+          warnRule(
+            `${item.name} was refused but still spent ${left.words}`,
+            'the refund did not restore it'
+          );
+          return null;
+        }
+        return spent.words;
+      } catch (e) {
+        warnRule(
+          `${item.name} was refused but spent ${spent.words}, and it could not be given back`,
+          e
+        );
+        return null;
       }
     };
 
@@ -2794,7 +2854,90 @@ export class QueryHandlers {
         results,
         refused: true,
       });
-    const targetObjs = targetToks.map((t: any) => t.object).filter(Boolean);
+    // Board #1887 (bridge 0.10.8 round 4): ask the ENGINE, before anything is spent, whether this use can happen.
+    // (1) The activity's own target count (dnd5e's evaluated `target.affects.count`), for a use that covers every
+    // target at once (a spell or anything that spends on use, a save, a damage activity, a heal, a buff): Midi-QOL checks
+    // a formula count only after the cost is paid (Hold Person, Bless, Magic Missile, Charm Person lost their slot), and
+    // the heal and buff paths never ran Midi (Cure Wounds healed three for one slot). A weapon at several targets is one attack per
+    // target and is not counted. (2) What dnd5e says it cannot pay (a Recharge ability not recharged, a used-up 1/Day,
+    // no legendary actions left, no charges): with Midi's gmConsumeResource 'both' Midi opens dnd5e's usage dialog
+    // instead of refusing, and nobody can answer it here. Both refusals are in the engine's own words.
+    // (3) Round 4, review S1: an activity that puts ONE effect of the caster's choice on its target (Blindness/Deafness,
+    // Hex, Bestow Curse, Contagion, Enlarge/Reduce, Protection from Energy): Midi-QOL (and the bridge's own buff path)
+    // applied every effect listed. The caller names the effect (the model for a monster, or what the player said); with
+    // several and none named, the use is refused and the choices listed. With one effect nothing changes.
+    let chosenEffect: EffectChoice | null = null;
+    {
+      // every path but a weapon attack that spends nothing covers all its targets in ONE use (the heal and buff paths,
+      // and the Midi path for a save or a plain damage activity such as Magic Missile)
+      const coversAll = !isAttack || activitySpendsOnUse(item, activity, spellLevel);
+      const allowed = engineTargetCount(activity);
+      const distinct = new Set(targetToks.map((t: any) => t.id)).size;
+      let refusal: { by: string; words: string; choices?: string[] } | null = null;
+      if (coversAll && allowed !== null && distinct > allowed) {
+        const fmt = (k: string, d: Record<string, unknown>) =>
+          (game as any)?.i18n?.format ? (game as any).i18n.format(k, d) : '';
+        refusal = { by: 'midi-qol', words: wrongNumberTargetsWords(allowed, fmt) };
+      } else if (!unarmed) {
+        try {
+          const costErrors = await usageCostErrors(activity);
+          if (costErrors?.length) refusal = { by: 'dnd5e', words: costErrors.join('; ') };
+        } catch (e) {
+          warnRule(
+            `dnd5e's own check of what ${item.name} costs could not run, so it was not checked before the use`,
+            e
+          );
+        }
+      }
+      if (!refusal) {
+        // what this path would put on each target: the buff path its own list (the item's effects); Midi's paths the
+        // activity's list, unless Midi-QOL applies no effects in this world (autoItemEffects 'off'); the heal path none
+        const midiApplies = _midiConfig ? _midiConfig.autoItemEffects !== 'off' : true;
+        const choices = isHeal
+          ? []
+          : isBuff
+            ? itemEffectChoices(spellEffects)
+            : midiApplies
+              ? activityEffectChoices(activity, item.type === 'spell' ? spellLevel : null)
+              : [];
+        if (choices.length > 1) {
+          const pick = pickEffectChoice(choices, data.effect);
+          if (pick.chosen) chosenEffect = pick.chosen;
+          else
+            refusal = {
+              by: 'rules',
+              words: effectChoiceWords(item.name, choices, pick.problem!, data.effect),
+              choices: choices.map(c => c.name),
+            };
+        } else if (choices.length === 1 && activity?.midiProperties?.chooseEffects) {
+          // the item asks Midi to offer a choice (a dialog nobody here can answer) of a single effect: that one
+          chosenEffect = choices[0];
+        }
+      }
+      if (refusal) {
+        for (const t of targetToks)
+          results.push({
+            target: t.name,
+            hpBefore: _hpNow(t),
+            hpAfter: _hpNow(t),
+            damage: 0,
+            hit: false,
+            via: isHeal ? 'heal' : isBuff ? 'buff' : isAttack ? 'attack' : 'save',
+            ...(refusal.by === 'rules' ? { needsChoice: true } : { engineRefused: true }),
+            refusedBy: refusal.by,
+            ...(refusal.choices ? { effectChoices: refusal.choices } : {}),
+            note: `${item.name} was not used: ${refusal.words}`,
+          });
+        return finish({
+          success: false,
+          attacker: attTok.name,
+          item: item.name,
+          results,
+          refused: true,
+        });
+      }
+    }
+
     attTok.object?.control({ releaseOthers: true });
 
     // ---- HEAL (Cure Wounds, Healing Word): Midi's cast no-ops headless, so roll + apply HP. ----
@@ -2835,7 +2978,14 @@ export class QueryHandlers {
 
     // ---- BUFF / UTILITY (Bless, etc.): apply the spell's active effect(s) to the targets. ----
     if (isBuff) {
-      const aes = spellEffects.map((e: any) => {
+      // Board #1887 (round 4, review S1): with a choice, only the caster's chosen effect goes on the targets.
+      const ce = chosenEffect;
+      const buffEffects = ce
+        ? spellEffects.filter(
+            (e: any) => (ce.uuid && e.uuid === ce.uuid) || (ce.id && e.id === ce.id)
+          )
+        : spellEffects;
+      const aes = buffEffects.map((e: any) => {
         const o = e.toObject();
         o.origin = item.uuid;
         o.disabled = false;
@@ -2855,7 +3005,12 @@ export class QueryHandlers {
         } catch (e) {
           /* ignore */
         }
-        results.push({ target: t.name, effectsApplied: applied, via: 'buff' });
+        results.push({
+          target: t.name,
+          effectsApplied: applied,
+          via: 'buff',
+          ...(chosenEffect ? { effectChosen: chosenEffect.name } : {}),
+        });
       }
       await consumeSlot();
       return finish({ success: true, attacker: attTok.name, item: item.name, results });
@@ -2891,12 +3046,6 @@ export class QueryHandlers {
       const _modes = ((_sys.attackModes as any[]) || []).map((m: any) => m?.value);
       const _reachFt =
         Number(_sys.range?.reach) || Number((globalThis as any).canvas?.dimensions?.distance) || 5;
-      // What the attack spends on use, read before and after a Midi run (said when a stopped attack still spent it).
-      const _spendNow = () => ({
-        slot: spellLevel > 0 ? (actor.system?.spells?.[`spell${spellLevel}`]?.value ?? null) : null,
-        itemUses: item.system?.uses?.value ?? null,
-        activityUses: activity.uses?.value ?? null,
-      });
       interface Prep {
         t: any;
         AC: number;
@@ -2942,9 +3091,8 @@ export class QueryHandlers {
       }
       let engineStuck: string | null = null;
       // Board #1887 (round 3): hit points read just before the Midi run that decides the target (as 618a313 did), so a
-      // target named twice starts its second result from the hit points the first left.
-      const _hpNow = (t: any) => t.actor?.system?.attributes?.hp?.value ?? 0;
-      const engineRefusal = (p: Prep, run: any) => ({
+      // target named twice starts its second result from the hit points the first left (_hpNow, above).
+      const engineRefusal = (p: Prep, run: any, refunded: string | null) => ({
         target: p.t.name,
         hpBefore: p.hpBefore,
         hpAfter: _hpNow(p.t),
@@ -2953,7 +3101,9 @@ export class QueryHandlers {
         via: 'attack',
         engine: 'midi-qol',
         engineRefused: true,
+        refusedBy: 'midi-qol',
         note: `Midi-QOL did not make the attack: ${run.refusedByEngine}`,
+        ...(refunded ? { refunded } : {}),
         engineNotes: run.notes,
       });
       // One result row per target, the same fields as before (brain 0.65.138 reads them), from one Midi run.
@@ -3030,6 +3180,9 @@ export class QueryHandlers {
           midiMs: run.ms,
           ...(oneUse ? { oneUseForAllTargets: true } : {}),
           ...(stoppedButSpent ? { spentAlthoughStopped: spent.words } : {}),
+          ...(run.guarded?.length ? { guardedAfterStop: true } : {}),
+          ...(run.templateNotPlaced ? { templateNotPlaced: true } : {}),
+          ...(run.effectChosen ? { effectChosen: run.effectChosen } : {}),
           ...(run.notes.length ? { engineNotes: run.notes } : {}),
         };
       };
@@ -3042,19 +3195,14 @@ export class QueryHandlers {
       };
       const notAttacked = (p: Prep, why: string) => ({
         target: p.t.name,
-        hpBefore: p.hpBefore,
-        hpAfter: p.hpBefore,
+        hpBefore: _hpNow(p.t),
+        hpAfter: _hpNow(p.t),
         damage: 0,
         hit: false,
         via: 'attack',
         engine: 'midi-qol',
         error: `not attacked: ${why}`,
       });
-      // The time one Midi run may take: its own limit, and never past the whole call's deadline.
-      const timeLeft = () => callDeadline - Date.now() - this.midiDeadlineMarginMs;
-      const runBudget = () => Math.min(this.midiAttackTimeoutMs, timeLeft());
-      const noTime =
-        'no time was left in this call (the MCP side waits 60 s for the whole call), so it was not started';
       if (oneUse) {
         const seen = new Set<string>();
         const early = new Map<Prep, any>();
@@ -3101,13 +3249,22 @@ export class QueryHandlers {
               activity,
               attTok,
               ready.map(p => p.t),
-              { attackMode: ready[0]?.choice.mode, reactions, timeoutMs: budget }
+              {
+                attackMode: ready[0]?.choice.mode,
+                reactions,
+                timeoutMs: budget,
+                kind: 'attack',
+                chosenEffect,
+              }
             );
             const stuck = run.timedOut ? stuckWords(run, Math.round(budget / 1000)) : null;
+            const refunded = run.refusedByEngine ? await refundIfSpent(spend0) : null;
             for (const p of ready)
               made.set(
                 p,
-                run.refusedByEngine ? engineRefusal(p, run) : rowFor(p, run, spend0, qty0, stuck)
+                run.refusedByEngine
+                  ? engineRefusal(p, run, refunded)
+                  : rowFor(p, run, spend0, qty0, stuck)
               );
           }
         }
@@ -3151,11 +3308,16 @@ export class QueryHandlers {
             attackMode: p.choice.mode,
             reactions,
             timeoutMs: budget,
+            kind: 'attack',
+            chosenEffect,
           });
           const stuck = run.timedOut ? stuckWords(run, Math.round(budget / 1000)) : null;
           if (stuck) engineStuck = stuck;
+          const refunded = run.refusedByEngine ? await refundIfSpent(spend0) : null;
           results.push(
-            run.refusedByEngine ? engineRefusal(p, run) : rowFor(p, run, spend0, qty0, stuck)
+            run.refusedByEngine
+              ? engineRefusal(p, run, refunded)
+              : rowFor(p, run, spend0, qty0, stuck)
           );
         }
       }
@@ -3175,50 +3337,52 @@ export class QueryHandlers {
       return finish({ success: true, attacker: attTok.name, item: item.name, results });
     }
 
-    // ---- SAVE / other (Sacred Flame, Fireball): Midi resolves the save + half/none damage. ----
+    // ---- SAVE / other (Sacred Flame, Fireball, a breath weapon): Midi resolves the save + half/none damage. ----
+    // Board #1887 (bridge 0.10.8 round 4): the save path goes through the same runner as attacks: the call's deadline,
+    // every dialog it left closed, the stop guard, Midi's own refusal in its words (and dnd5e's refund when Midi refused
+    // after paying), and no reactions (Midi's own noProvokeReaction; operator "With the chooser"). Before, it waited for
+    // Midi's own 90 s (past the MCP side's 60 s) and left any dialog open.
     targetToks.forEach((t: any) =>
       t.object?.setTarget(true, { user: (game as any).user, releaseOthers: false })
     );
-    const before = targetToks.map((t: any) => ({ hp: t.actor?.system?.attributes?.hp?.value }));
-    // Board #1887 (round 3): what dnd5e and Midi-QOL tell the GM while it runs, so a use Midi-QOL itself refuses (its
-    // requiresTargets rule: more targets than the spell takes) is said in its words instead of reading as "no damage".
-    const saveNotes: string[] = [];
-    const restoreNotes = this._captureNotes(saveNotes);
-    let saveWf: any = undefined;
-    let saveThrew = false;
-    try {
-      saveWf = await MidiQOL.completeActivityUse(
-        activity,
-        {
-          midiOptions: {
-            targetsToUse: new Set(targetObjs),
-            autoRollAttack: true,
-            autoRollDamage: 'always',
-            fastForwardAttack: true,
-            fastForwardDamage: true,
-          },
-        },
-        { configure: false },
-        {}
-      );
-    } catch (e) {
-      /* swallow late headless UI throw */
-      saveThrew = true;
-    } finally {
-      restoreNotes();
+    const before = targetToks.map((t: any) => ({ hp: _hpNow(t) }));
+    if (timeLeft() < this.midiMinRunMs) {
+      for (const t of targetToks)
+        results.push({
+          target: t.name,
+          hpBefore: _hpNow(t),
+          hpAfter: _hpNow(t),
+          damage: 0,
+          via: 'save',
+          engine: 'midi-qol',
+          error: `not cast: ${noTime}`,
+        });
+      return finish({ success: false, attacker: attTok.name, item: item.name, results });
     }
-    if (!saveThrew && !saveWf && saveNotes.length) {
+    const saveBudget = runBudget();
+    const saveSpend0 = _spendNow();
+    const saveRun = await this._runMidiAttack(MidiQOL, activity, attTok, targetToks, {
+      attackMode: undefined,
+      reactions: data.reactions === true,
+      timeoutMs: saveBudget,
+      kind: 'save',
+      chosenEffect,
+    });
+    if (saveRun.refusedByEngine) {
+      const refunded = await refundIfSpent(saveSpend0);
       for (let i = 0; i < targetToks.length; i++)
         results.push({
           target: targetToks[i].name,
           hpBefore: before[i].hp,
-          hpAfter: before[i].hp,
+          hpAfter: _hpNow(targetToks[i]),
           damage: 0,
           via: 'save',
           engine: 'midi-qol',
           engineRefused: true,
-          note: `Midi-QOL did not cast it: ${saveNotes.join('; ')}`,
-          engineNotes: saveNotes,
+          refusedBy: 'midi-qol',
+          note: `Midi-QOL did not cast it: ${saveRun.refusedByEngine}`,
+          ...(refunded ? { refunded } : {}),
+          engineNotes: saveRun.notes,
         });
       return finish({
         success: false,
@@ -3228,30 +3392,70 @@ export class QueryHandlers {
         refused: true,
       });
     }
-    for (let w = 0; w < 7; w++) {
-      await new Promise(r => setTimeout(r, 300));
-      if (
-        targetToks.some(
-          (t: any, i: number) => t.actor?.system?.attributes?.hp?.value !== before[i].hp
-        )
-      )
-        break;
+    let saveError: string | null = saveRun.error;
+    if (saveRun.timedOut) {
+      const at = saveRun.stuckAt ? ` (it stopped at ${saveRun.stuckAt})` : '';
+      const dialogs = saveRun.dialogs.length
+        ? `; a window nobody here can answer was open and was closed (${saveRun.dialogs.join(', ')})`
+        : '';
+      saveError = `Midi-QOL's workflow did not finish within ${Math.round(saveBudget / 1000)} s${at}${dialogs}; the spell was stopped`;
+    } else if (!saveRun.wf && !saveError) {
+      saveError =
+        "Midi-QOL's workflow gave nothing back, so nothing was cast (the item could not be used, or the workflow did not start)";
+    }
+    if (saveRun.error && !saveRun.timedOut) {
+      // A late throw from the headless page after Midi applied the save's damage (the old path swallowed these): the
+      // spell counts as cast when the hit points moved; the throw is still said.
+      for (let w = 0; w < 7; w++) {
+        if (targetToks.some((t: any, i: number) => _hpNow(t) !== before[i].hp)) break;
+        await new Promise(r => setTimeout(r, 300));
+      }
+      if (targetToks.some((t: any, i: number) => _hpNow(t) !== before[i].hp)) {
+        warnRule(`Midi-QOL threw after ${item.name} was cast`, saveRun.error);
+        saveError = null;
+      }
+    }
+    if (saveError) warnRule(`${item.name} did not go through Midi-QOL's workflow`, saveError);
+    const spent = spentOnUse(saveSpend0, _spendNow());
+    const stoppedButSpent = !!saveError && spent.any;
+    if (stoppedButSpent)
+      warnRule(
+        `${item.name} was stopped, but it still spent ${spent.words}`,
+        'dnd5e spent it when the item was used'
+      );
+    if (!saveError && !saveRun.wf) {
+      // No workflow came back (a thrown page, above): a short wait for the hit points to arrive. A finished workflow
+      // has already applied them (completeActivityUse answers after Midi's cleanup).
+      for (let w = 0; w < 7; w++) {
+        if (targetToks.some((t: any, i: number) => _hpNow(t) !== before[i].hp)) break;
+        await new Promise(r => setTimeout(r, 300));
+      }
     }
     for (let i = 0; i < targetToks.length; i++) {
       const t = targetToks[i];
-      const hpAfter = t.actor?.system?.attributes?.hp?.value;
+      const hpAfter = _hpNow(t);
       results.push({
         target: t.name,
         hpBefore: before[i].hp,
         hpAfter,
         damage: (before[i].hp ?? 0) - (hpAfter ?? 0),
         via: 'save',
+        engine: 'midi-qol',
+        error: saveError,
+        midiState: saveRun.wf?.currentAction?.name ?? null,
+        midiMs: saveRun.ms,
+        reactions: data.reactions === true ? 'on' : 'off',
+        ...(stoppedButSpent ? { spentAlthoughStopped: spent.words } : {}),
+        ...(saveRun.guarded?.length ? { guardedAfterStop: true } : {}),
+        ...(saveRun.templateNotPlaced ? { templateNotPlaced: true } : {}),
+        ...(saveRun.effectChosen ? { effectChosen: saveRun.effectChosen } : {}),
+        ...(saveRun.notes.length ? { engineNotes: saveRun.notes } : {}),
       });
     }
     // Board #1887 (bridge 0.10.8): no slot is spent here. dnd5e's own activity.use, inside Midi-QOL's workflow above,
     // already spends it; measured on the test stack 2026-09-27, a level 1 save spell (Dissonant Whispers) through this
     // path took TWO slots (2 -> 0) until this line went.
-    return finish({ success: true, attacker: attTok.name, item: item.name, results });
+    return finish({ success: !saveError, attacker: attTok.name, item: item.name, results });
   }
 
   /**
@@ -3304,7 +3508,13 @@ export class QueryHandlers {
     activity: any,
     attTok: any,
     targets: any[],
-    opts: { attackMode: string | undefined; reactions: boolean; timeoutMs: number }
+    opts: {
+      attackMode: string | undefined;
+      reactions: boolean;
+      timeoutMs: number;
+      kind?: 'attack' | 'save';
+      chosenEffect?: EffectChoice | null;
+    }
   ): Promise<{
     wf: any;
     timedOut: boolean;
@@ -3314,6 +3524,8 @@ export class QueryHandlers {
     dialogs: string[];
     guarded: string[];
     refusedByEngine: string | null;
+    templateNotPlaced: boolean;
+    effectChosen: string | null;
     ms: number;
   }> {
     const g: any = globalThis as any;
@@ -3328,6 +3540,8 @@ export class QueryHandlers {
       dialogs: [] as string[],
       guarded: [] as string[],
       refusedByEngine: null as string | null,
+      templateNotPlaced: false,
+      effectChosen: null as string | null,
       ms: 0,
     };
     if (typeof MidiQOL?.completeActivityUse !== 'function') {
@@ -3344,22 +3558,101 @@ export class QueryHandlers {
     const appsBefore = new Set<any>([...(g.foundry?.applications?.instances?.values?.() ?? [])]);
     const v1Before = new Set<any>(Object.values(g.ui?.windows ?? {}));
     const restoreNotes = this._captureNotes(notes);
-    const usage = {
+    const usage: any = {
       midiOptions: {
-        ...midiAttackOptions({
-          attackMode: opts.attackMode,
-          reactions: opts.reactions,
-          skipDiceAnimation: this.midiSkipDiceAnimation,
-        }),
+        ...(opts.kind === 'save'
+          ? midiSaveOptions({
+              reactions: opts.reactions,
+              skipDiceAnimation: this.midiSkipDiceAnimation,
+            })
+          : midiAttackOptions({
+              attackMode: opts.attackMode,
+              reactions: opts.reactions,
+              skipDiceAnimation: this.midiSkipDiceAnimation,
+            })),
         targetsToUse: new Set(targets.map((t: any) => t.object)),
       },
+      // Board #1887 (round 4): never place a measured template. An area activity (a breath weapon's line or cone)
+      // otherwise makes dnd5e wait for a mouse click on the canvas (its template placement), which nobody gives in the
+      // headless GM browser: measured on the test stack, a recharged Fire Breath stopped at 25 s with the placement
+      // still waiting. The targets are the ones named in the call.
+      create: { measuredTemplate: false },
     };
     const TIMEOUT = Symbol('timeout');
     let timer: any;
+    let areaWatch: any;
+    // Board #1887 (round 4, review S1): the caster's ONE chosen effect. Midi-QOL 14.0.12 applies every effect the
+    // activity lists unless the activity's midiProperties.chooseEffects is on, and then asks in a dialog nobody can
+    // answer here (Workflow.ts 2667, chooseEffects 7590). Its own pre-state hook for THIS use's workflow (by sequence
+    // id), `midi-qol.preApplyDynamicEffects`, turns that switch on for this workflow only and answers the choice itself
+    // with the caster's effect (the caster's own effects stay); the switch is put back as soon as Midi has read it.
+    let effectHook: number | null = null;
+    let effectRestore: (() => void) | null = null;
+    const hooks: any = g.Hooks;
+    if (opts.chosenEffect && typeof hooks?.on === 'function') {
+      const chosen = opts.chosenEffect;
+      effectHook = hooks.on('midi-qol.preApplyDynamicEffects', (w: any) => {
+        try {
+          const seq = usage.sequenceId;
+          if (!w || (seq ? w.sequenceId !== seq : w.activity?.uuid !== activity.uuid)) return;
+          const act = w.activity ?? activity;
+          act.midiProperties ??= {};
+          const mp = act.midiProperties;
+          const old = mp.chooseEffects;
+          mp.chooseEffects = true;
+          effectRestore = () => {
+            mp.chooseEffects = old;
+          };
+          w.chooseEffects = async (effects: any[]) => {
+            effectRestore?.();
+            effectRestore = null;
+            const kept = keepChosenEffect(effects, chosen);
+            res.effectChosen = chosen.name;
+            if (!kept.some((ef: any) => ef?.uuid === chosen.uuid || ef?.id === chosen.id))
+              notes.push(
+                `Midi-QOL did not offer ${chosen.name}, so no effect of the choice was applied`
+              );
+            return kept;
+          };
+        } catch (e: any) {
+          notes.push(
+            `the caster's chosen effect could not be given to Midi-QOL: ${String(e?.message ?? e)}`
+          );
+        }
+      });
+    }
     try {
       const run = Promise.resolve().then(() =>
         MidiQOL.completeActivityUse(activity, usage, { configure: false }, {})
       );
+      // With no template placed, Midi-QOL 14.0.12 still expects one for an area activity (Workflow.ts,
+      // expectedTemplateCount) and suspends in WorkflowState_AwaitTemplate after the use. Its own way on is
+      // unSuspend({itemUseComplete: true}) (Workflow.ts 1961: then AoETargetConfirmation with the targets given); it is
+      // said once, only to THIS use's workflow (its sequence id), only while it waits there with no template.
+      areaWatch = setInterval(() => {
+        try {
+          const seq = usage.sequenceId;
+          if (!seq) return;
+          const w = [...(MidiQOL.Workflow?.workflows?.values?.() ?? [])]
+            .map((x: any) => (typeof x?.deref === 'function' ? x.deref() : x))
+            .find((x: any) => x?.sequenceId === seq);
+          if (
+            w &&
+            !res.templateNotPlaced &&
+            w.suspended &&
+            /AwaitTemplate/.test(String(w.currentAction?.name ?? '')) &&
+            !(w.templateUuids?.length > 0) &&
+            typeof w.unSuspend === 'function'
+          ) {
+            res.templateNotPlaced = true;
+            Promise.resolve(w.unSuspend({ itemUseComplete: true })).catch((e: any) =>
+              notes.push(`Midi-QOL did not go on without a template: ${String(e?.message ?? e)}`)
+            );
+          }
+        } catch (e) {
+          /* the next tick looks again */
+        }
+      }, 200);
       const got = await Promise.race([
         run,
         new Promise(r => {
@@ -3372,6 +3665,9 @@ export class QueryHandlers {
       res.error = `Midi-QOL's attack workflow failed: ${String((e && (e.message || e)) || e)}`;
     } finally {
       clearTimeout(timer);
+      clearInterval(areaWatch);
+      if (effectHook !== null) hooks.off('midi-qol.preApplyDynamicEffects', effectHook);
+      (effectRestore as (() => void) | null)?.();
       restoreNotes();
     }
     if (res.timedOut) {
@@ -3381,17 +3677,24 @@ export class QueryHandlers {
           .map((w: any) => (typeof w?.deref === 'function' ? w.deref() : w))
           .filter(Boolean);
         const done = /Completed|Cleanup|Abort|RollFinished/;
+        // Board #1887 (round 4): THIS use's workflow, by the sequence id Midi-QOL puts on the bridge's own usage object
+        // (utils.ts completeActivityUse, MidiActivityMixin.ts 673), never another use of the same item that happens to
+        // be running; the item's activity only when Midi set no id.
+        const seq = usage.sequenceId;
         const mine = all.filter(
           (w: any) =>
-            (w.activity?.uuid === activity.uuid ||
-              (w.actor === attTok.actor && w.item?.name === activity.item?.name)) &&
+            (seq
+              ? w.sequenceId === seq
+              : w.activity?.uuid === activity.uuid ||
+                (w.actor === attTok.actor && w.item?.name === activity.item?.name)) &&
             !done.test(String(w.currentAction?.name ?? ''))
         );
         for (const w of mine) {
           res.stuckAt = String(w.currentAction?.name ?? '').replace(/^bound /, '') || res.stuckAt;
-          // Board #1887 (round 3): its own state loop may still be waiting (a reaction prompt, a dice animation); from
-          // any state it enters next it goes to Abort, so no damage lands after this answer says "stopped".
-          if (this.midiGuardStoppedWorkflows) res.guarded = guardStoppedWorkflow(w);
+          // Board #1887 (round 3): its own state loop may still be waiting (a reaction prompt, a save, a dice
+          // animation); from any state it enters next it goes to Abort, so no damage lands after this answer says
+          // "stopped". Every workflow stopped is reported (guardedAfterStop).
+          if (this.midiGuardStoppedWorkflows) res.guarded.push(...guardStoppedWorkflow(w));
           try {
             w.aborted = true;
             if (typeof w.performState === 'function') await w.performState(w.WorkflowState_Abort);
@@ -3426,10 +3729,15 @@ export class QueryHandlers {
         /* no window list; nothing to close */
       }
     }
-    // Board #1887 (round 3): Midi-QOL refused the use itself (no workflow, no error, no timeout), e.g. more targets
-    // than the spell takes when its `requiresTargets` rule is on; its own warning says why.
-    if (!res.timedOut && !res.error && !res.wf && notes.length)
-      res.refusedByEngine = notes.join('; ');
+    // Board #1887 (round 3, 4): Midi-QOL refused the use itself: no workflow (its requiresTargets check, before the
+    // cost) or a workflow it aborted (its formula target count, after the cost: WorkflowState_AoETargetConfirmation).
+    // Only Midi-QOL's own refusal texts count as the reason; any other notice shown meanwhile stays an engine note.
+    if (!res.timedOut && !res.error && (!res.wf || res.wf.aborted === true)) {
+      const localize = (k: string) =>
+        g.game?.i18n?.localize ? String(g.game.i18n.localize(k)) : '';
+      const why = notes.filter(n => isMidiRefusalText(n, localize));
+      if (why.length) res.refusedByEngine = why.join('; ');
+    }
     res.ms = Date.now() - started;
     return res;
   }

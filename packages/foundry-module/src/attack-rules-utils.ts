@@ -284,6 +284,39 @@ export function midiAttackOptions(input: MidiAttackOptionsInput): {
   };
 }
 
+/**
+ * Board #1887 (bridge 0.10.8 round 4): the `usage.midiOptions` the SAVE path hands to `MidiQOL.completeActivityUse`
+ * (Sacred Flame, a breath weapon, Hold Person). As the attack path: no dialog (the rolls fast-forwarded, the target
+ * given, `targetConfirmation: 'none'`) and Midi's own `noProvokeReaction` unless the caller asks for reactions: Midi
+ * offers reactions on a save (Workflow.ts 5947, 6267) and on damage (utils.ts 587), all gated by that switch; the
+ * operator: reactions stay off until the aidm-rules chooser exists ("With the chooser"). Damage is rolled whatever the
+ * save ('always'), as before.
+ */
+export function midiSaveOptions(input: {
+  reactions?: boolean | undefined;
+  skipDiceAnimation?: boolean | undefined;
+}): {
+  autoRollAttack: true;
+  fastForwardAttack: true;
+  autoRollDamage: 'always';
+  fastForwardDamage: true;
+  workflowOptions: Record<string, unknown>;
+} {
+  const workflowOptions: Record<string, unknown> = { targetConfirmation: 'none' };
+  if (!input.reactions) workflowOptions.noProvokeReaction = true;
+  if (input.skipDiceAnimation) {
+    workflowOptions.attackRollDSN = false;
+    workflowOptions.damageRollDSN = false;
+  }
+  return {
+    autoRollAttack: true,
+    fastForwardAttack: true,
+    autoRollDamage: 'always',
+    fastForwardDamage: true,
+    workflowOptions,
+  };
+}
+
 /** Midi-QOL 14.0.12's critical damage choices (settings.ts, `criticalDamageChoices`). */
 export const MIDI_CRITICAL_DAMAGE_CHOICES: readonly string[] = [
   'default',
@@ -563,9 +596,13 @@ export function spentOnUse(before: SpendState, after: SpendState): { any: boolea
 /**
  * The Midi-QOL 14.0.12 workflow states that roll or apply something after the attack roll. When execute-attack stops a
  * stuck workflow it calls `performState(WorkflowState_Abort)`, but the workflow's OWN state loop may still be waiting
- * inside a state (a reaction prompt of 10 s, a Dice So Nice animation). When that wait ends, Midi's loop runs the next
- * state it was handed even though `aborted` is set (Workflow.ts `performState`: while aborting it skips only the hooks)
- * and `WorkflowState_AllRollsComplete` has no abort check, so the damage would land after the answer said "stopped".
+ * inside a state (a reaction prompt, a save roll, a Dice So Nice animation). When that wait ends, Midi's loop runs the
+ * next state it was handed even though `aborted` is set (Workflow.ts `performState`: while aborting it skips only the
+ * hooks). Most states check `aborted` first (AttackRollComplete at Workflow.ts 2137 and 2147, DamageRollComplete at
+ * 2273, WaitForSaves after its save rolls at 2348 and 2370), but WaitForSaves' EARLY exits (2315 to 2327, the other
+ * activity's cost, and 2340, no save) hand over SavesComplete, which hands over AllRollsComplete, which applies the
+ * damage with no abort check: that path could land damage after the answer said "stopped". Every later state is
+ * listed, so no path is left open.
  */
 export const MIDI_STATES_AFTER_STOP: readonly string[] = [
   'WorkflowState_AttackRollComplete',
@@ -602,4 +639,220 @@ export function guardStoppedWorkflow(wf: any): string[] {
   }
   wf.aidmStoppedByBridge = true;
   return done;
+}
+
+// ================================================================================================
+// Bridge 0.10.8 round 4 (board #1887): what the ENGINE would refuse, asked before the use.
+// ================================================================================================
+
+/**
+ * The number of targets the activity itself allows, as dnd5e has worked it out (its `target.affects.count`, a formula
+ * such as Hold Person's `@item.level - 1` already evaluated by dnd5e's data preparation), or null when it sets none.
+ * Midi-QOL 14.0.12 checks a formula count only AFTER the cost is paid (Workflow.ts `WorkflowState_AoETargetConfirmation`,
+ * 1998 to 2004), so a spell at too many targets lost its slot; a plain count is checked before (when `requiresTargets`
+ * is on). The bridge's heal and buff paths never run Midi at all.
+ */
+export function engineTargetCount(activity: any): number | null {
+  const raw = activity?.target?.affects?.count;
+  if (raw === undefined || raw === null || raw === '') return null;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/** Midi-QOL 14.0.12's own words (lang/en.json) for a use it refuses, keyed by its i18n key. */
+export const MIDI_REFUSAL_TEXT: Readonly<Record<string, string>> = {
+  'midi-qol.wrongNumberTargets':
+    'You must target at most {allowedTargets} token(s) before rolling the attack',
+  'midi-qol.noTargets': 'You must target a token before rolling the attack',
+};
+
+/** Midi-QOL's words for "too many targets", in the world's language when its text is loaded. */
+export function wrongNumberTargetsWords(
+  allowed: number,
+  format?: (key: string, data: Record<string, unknown>) => string
+): string {
+  const key = 'midi-qol.wrongNumberTargets';
+  try {
+    const text = format ? format(key, { allowedTargets: allowed }) : '';
+    if (text && text !== key) return text;
+  } catch (e) {
+    /* the fallback below is Midi's own English text */
+  }
+  return MIDI_REFUSAL_TEXT[key].replace('{allowedTargets}', String(allowed));
+}
+
+/**
+ * Is a notification one of Midi-QOL's own refusal texts? Only those count as "the engine refused the use"; any other
+ * notice shown while it ran (a toast from another add-on, dnd5e's info) stays an engine note and is never taken as the
+ * reason. `localize` gives the world's text for a key (Foundry's game.i18n.localize); the English text is the fallback.
+ */
+export function isMidiRefusalText(text: string, localize?: (key: string) => string): boolean {
+  if (!text) return false;
+  for (const [key, english] of Object.entries(MIDI_REFUSAL_TEXT)) {
+    const templates = [english];
+    try {
+      const local = localize ? localize(key) : '';
+      if (local && local !== key) templates.push(local);
+    } catch (e) {
+      /* English only */
+    }
+    for (const t of templates) {
+      const body = t
+        .split(/\{[^}]+\}/)
+        .map(part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+        .join('.+?');
+      const re = new RegExp(`^${body}$`);
+      if (re.test(text.trim())) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * What dnd5e 5.3.3 itself says it cannot pay for this use: its own `_prepareUsageUpdates(config, {returnErrors: true})`
+ * on its own `_prepareUsageConfig`, the same pair Midi-QOL's `checkAutoConsume` runs (MidiActivityMixin.ts 869 to 880).
+ * With Midi's `gmConsumeResource: 'both'`, a cost that cannot be paid (a Recharge ability not recharged, a used-up
+ * 1/Day, no legendary actions left, a wand with no charges, no slot) makes Midi OPEN dnd5e's usage dialog instead of
+ * refusing, and nobody can answer it in the headless GM browser. Returns dnd5e's messages (empty when it can pay), or
+ * null when the check itself could not run.
+ */
+export async function usageCostErrors(activity: any): Promise<string[] | null> {
+  if (
+    typeof activity?._prepareUsageConfig !== 'function' ||
+    typeof activity?._prepareUsageUpdates !== 'function'
+  )
+    return null;
+  const config = activity._prepareUsageConfig({});
+  const result = await activity._prepareUsageUpdates(config, { returnErrors: true });
+  if (Array.isArray(result)) return result.map((e: any) => String(e?.message ?? e)).filter(Boolean);
+  return [];
+}
+
+/**
+ * dnd5e's own "consumed" record (ActorDeltasData: actor `{keyPath, delta}` rows, item rows by id) for what a use spent,
+ * built from two readings, so dnd5e's own `activity.refund(consumed)` can give it back when Midi-QOL refused the use
+ * after paying for it. Only spell slots and limited uses (the item's and the activity's) are read.
+ */
+export function consumedDeltas(
+  before: SpendState,
+  after: SpendState,
+  ids: { spellLevel: number; itemId: string | null; activityId: string | null }
+): {
+  actor: { keyPath: string; delta: number }[];
+  item: Record<string, { keyPath: string; delta: number }[]>;
+} {
+  const out: {
+    actor: { keyPath: string; delta: number }[];
+    item: Record<string, { keyPath: string; delta: number }[]>;
+  } = { actor: [], item: {} };
+  const dropped = (a: number | null, b: number | null) =>
+    typeof a === 'number' && typeof b === 'number' && b < a ? a - b : 0;
+  const s = dropped(before.slot, after.slot);
+  if (s && ids.spellLevel > 0)
+    out.actor.push({ keyPath: `system.spells.spell${ids.spellLevel}.value`, delta: -s });
+  const rows: { keyPath: string; delta: number }[] = [];
+  const i = dropped(before.itemUses, after.itemUses);
+  if (i) rows.push({ keyPath: 'system.uses.spent', delta: i });
+  const a = dropped(before.activityUses, after.activityUses);
+  if (a && ids.activityId)
+    rows.push({ keyPath: `system.activities.${ids.activityId}.uses.spent`, delta: a });
+  if (rows.length && ids.itemId) out.item[ids.itemId] = rows;
+  return out;
+}
+
+/**
+ * Board #1887 (bridge 0.10.8 round 4, review S1): one effect of the caster's choice. With Midi-QOL's autoItemEffects on,
+ * Midi applies EVERY effect an activity lists, because its `chooseEffects` switch defaults to false
+ * (MidiActivityMixin.ts 217; Workflow.ts 2651-2672): Blindness/Deafness gave blinded AND deafened, Hex and Contagion
+ * all six. The rules say the caster chooses one. An effect the activity would put on a target: one that exists, is not
+ * a transfer or an enchantment, fits the level cast and is not an "on a successful save" effect (Midi's own
+ * isApplicableEffect); the caster's own effects (DAE selfTarget, selfTargetAlways) are not part of the choice.
+ */
+export interface EffectChoice {
+  name: string;
+  id: string | null;
+  uuid: string | null;
+  statuses: string[];
+}
+
+const isSelfEffect = (ef: any) =>
+  !!(ef?.flags?.dae?.selfTarget || ef?.flags?.dae?.selfTargetAlways);
+
+function toChoice(ef: any): EffectChoice {
+  return {
+    name: String(ef?.name ?? ''),
+    id: ef?.id ?? ef?._id ?? null,
+    uuid: ef?.uuid ?? null,
+    statuses: [...(ef?.statuses ?? [])].map(s => String(s)),
+  };
+}
+
+/** The effects Midi-QOL would put on each affected target, for the one-of-them choice (see EffectChoice). */
+export function activityEffectChoices(activity: any, level?: number | null): EffectChoice[] {
+  const lvl = Number.isFinite(level as number) ? Number(level) : Number(activity?.relevantLevel);
+  const out: EffectChoice[] = [];
+  for (const ed of [...(activity?.effects ?? [])]) {
+    const ef = ed?.effect;
+    if (!ef || ef.transfer === true || ef.type === 'enchantment' || ed.onSave === true) continue;
+    if (Number.isFinite(lvl)) {
+      if ((ed.level?.min ?? -Infinity) > lvl || lvl > (ed.level?.max ?? Infinity)) continue;
+    }
+    if (isSelfEffect(ef)) continue;
+    out.push(toChoice(ef));
+  }
+  return out;
+}
+
+/** The effects the bridge's own buff path would put on each target (the item's own, not the caster's). */
+export function itemEffectChoices(effects: any[]): EffectChoice[] {
+  return (effects ?? []).filter(ef => ef && !ef.transfer && !isSelfEffect(ef)).map(toChoice);
+}
+
+/**
+ * The effect the caller named, out of the choices: its exact name, else the condition it gives ("blinded" is
+ * Blindness), else the one name that contains the words ("strength" is "Hexed Strength"). Case does not matter.
+ */
+export function pickEffectChoice(
+  choices: EffectChoice[],
+  wanted: string | null | undefined
+): { chosen?: EffectChoice; problem?: 'missing' | 'unknown' | 'ambiguous' } {
+  const w = String(wanted ?? '')
+    .trim()
+    .toLowerCase();
+  if (!w) return { problem: 'missing' };
+  const by = (f: (c: EffectChoice) => boolean) => choices.filter(f);
+  for (const found of [
+    by(c => c.name.toLowerCase() === w),
+    by(c => c.statuses.some(s => s.toLowerCase() === w)),
+    by(c => c.name.toLowerCase().includes(w)),
+  ]) {
+    if (found.length === 1) return { chosen: found[0] };
+    if (found.length > 1) return { problem: 'ambiguous' };
+  }
+  return { problem: 'unknown' };
+}
+
+/** What the answer says when the caster's choice is missing or does not fit (the choices listed). */
+export function effectChoiceWords(
+  itemName: string,
+  choices: EffectChoice[],
+  problem: 'missing' | 'unknown' | 'ambiguous',
+  wanted?: string | null
+): string {
+  const list = choices.map(c => c.name).join(', ');
+  if (problem === 'missing')
+    return `${itemName} puts ONE effect of the caster's choice on its target (the rules), and none was named: choose one of ${list} (effect)`;
+  if (problem === 'ambiguous')
+    return `"${wanted}" fits more than one effect of ${itemName}: choose one of ${list} (effect)`;
+  return `${itemName} has no effect "${wanted}": choose one of ${list} (effect)`;
+}
+
+/** Midi's effect list, cut to the caster's choice (by uuid or, the same item's, by id); the caster's own effects stay. */
+export function keepChosenEffect(effects: any[], chosen: EffectChoice): any[] {
+  return (effects ?? []).filter(
+    ef =>
+      isSelfEffect(ef) ||
+      (chosen.uuid && ef?.uuid === chosen.uuid) ||
+      (chosen.id && (ef?.id ?? ef?._id) === chosen.id)
+  );
 }

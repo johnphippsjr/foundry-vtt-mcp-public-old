@@ -154,3 +154,31 @@ describe("execute-attack tool: Midi-QOL reactions are not the model's to switch 
     });
   });
 });
+
+// Board #1887 (bridge 0.10.8 round 4, review S1): Midi-QOL applied EVERY effect an activity lists (Blindness/Deafness
+// gave both); the rules say the caster chooses one, so the tool takes the chosen effect and forwards it.
+describe("execute-attack tool: the caster's one chosen effect", () => {
+  it('is advertised with an optional effect field that says the choices come back when it is missing', () => {
+    const { tools } = makeTools();
+    const def = tools.getToolDefinitions().find(d => d.name === 'execute-attack');
+    expect(def!.inputSchema.properties).toHaveProperty('effect');
+    expect((def!.inputSchema.properties as any).effect.description).toMatch(/effectChoices/);
+    expect(def!.inputSchema.required).toEqual(['attacker', 'item', 'targets']);
+  });
+
+  it('forwards the chosen effect to the bridge query', async () => {
+    const { tools, query } = makeTools();
+    await tools.handleExecuteAttack({
+      attacker: 'k1',
+      item: 'Blindness/Deafness',
+      targets: ['b1'],
+      effect: 'Blindness',
+    });
+    expect(query).toHaveBeenCalledWith('foundry-mcp-bridge.executeAttack', {
+      attacker: 'k1',
+      item: 'Blindness/Deafness',
+      targets: ['b1'],
+      effect: 'Blindness',
+    });
+  });
+});
