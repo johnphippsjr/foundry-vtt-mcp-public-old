@@ -73,6 +73,10 @@ let midiConfig: any;
 let unseen: Set<string>;
 let midiDelayMs = 0;
 let stuckDialogs: string[] = ['AttackRollConfigurationDialog'];
+// Board #1887 (round 3): DAE present (the reaction prompt waits this long, then Midi's own state loop goes ON to the
+// damage), and Midi refusing a use with more targets than this (its `requiresTargets` rule; 0 = off).
+let lateReactionMs = 0;
+let midiRefuseOver = 0;
 
 function getProperty(obj: any, path: string) {
   return path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
@@ -464,6 +468,14 @@ function install(toks: Tok[]) {
         return new Promise(() => {});
       }
       if (midiThrows.completeActivityUse) throw new Error('the roll dialog was closed');
+      // Midi-QOL's own target count check (MidiActivityMixin.ts, `requiresTargets` on): a warning, no workflow, and
+      // nothing spent (it runs before dnd5e's use).
+      if (midiRefuseOver && targets.length > midiRefuseOver) {
+        g.ui.notifications.warn(
+          `Wrong number of targets selected. You must select ${midiRefuseOver} target(s)`
+        );
+        return undefined;
+      }
       // dnd5e activity.use: a levelled spell spends a slot.
       if (item.type === 'spell' && (item.system.level || 0) > 0) {
         const k = `system.spells.spell${item.system.level}.value`;
@@ -535,6 +547,25 @@ function install(toks: Tok[]) {
         const ac = baseAc + (tDoc.cover === Infinity ? Infinity : tDoc.cover || 0);
         const hit = Number.isFinite(ac) && (crit || (!fumble && roll.total >= ac));
         // reactions: without DAE, a reaction prompt crashes the workflow (doReactions).
+        if (hit && tDoc.actor.reactions?.length && !wo.noProvokeReaction && lateReactionMs) {
+          // WITH DAE: the prompt waits (nobody answers), then Midi's own state loop goes on to the state it was handed,
+          // read from the workflow object (Workflow.ts: `return this.WorkflowState_AllRollsComplete`), and
+          // AllRollsComplete applies the damage with no abort check.
+          const w = stuck(wfId, 'WorkflowState_AttackRollComplete');
+          w.activity = activity;
+          w.WorkflowState_AllRollsComplete = async function (this: any) {
+            tDoc.actor.system.attributes.hp.value -= 5;
+            return this.WorkflowState_Cleanup;
+          };
+          w.WorkflowState_Cleanup = { name: 'WorkflowState_Cleanup' };
+          return new Promise(resolve => {
+            setTimeout(async () => {
+              const next = w.WorkflowState_AllRollsComplete;
+              await next.call(w);
+              resolve(w);
+            }, lateReactionMs);
+          });
+        }
         if (hit && tDoc.actor.reactions?.length && !wo.noProvokeReaction) {
           const w = stuck(wfId, 'WorkflowState_AttackRollComplete');
           w.activity = activity;
@@ -666,6 +697,8 @@ beforeEach(() => {
   unseen = new Set();
   midiDelayMs = 0;
   stuckDialogs = ['AttackRollConfigurationDialog'];
+  lateReactionMs = 0;
+  midiRefuseOver = 0;
 });
 
 describe("bridge 0.10.8: the attack is Midi-QOL's own workflow (engine map M07)", () => {
@@ -1687,5 +1720,166 @@ describe('an unseen target: the engine decides, the bridge no longer refuses (20
     const res = await attack();
     expect(res.refused).toBe(true);
     expect(res.results[0].note).toBe('a wall is in the way: Dagger cannot reach Brakka');
+  });
+});
+
+// ================================================================================================
+// Board #1887 (bridge 0.10.8 round 3): the re-review of f30cdc7
+// ================================================================================================
+
+async function attackWith(
+  setup: (h: any) => void,
+  item: string,
+  targets: string[],
+  more: any = {}
+) {
+  const h = new QueryHandlers() as any;
+  h.midiAttackTimeoutMs = 60;
+  setup(h);
+  return h.handleExecuteAttack({ attacker: 'kobold', item, targets, ...more });
+}
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+describe('a stopped workflow never applies damage later (reactions stay off until the chooser; fixed before)', () => {
+  it('reactions on WITH DAE: the bridge stops the attack, and the prompt ending later does not damage the target', async () => {
+    const knight = makeActor('Brakka', [], 20, 16, {}, { reactions: ['Parry'] });
+    world({ targetFeet: 5, target: knight });
+    d20Queue = [15];
+    lateReactionMs = 150; // the prompt waits 150 ms; the bridge gives up at 60 ms
+    const res = await attack('Dagger', ['brakka'], undefined, { reactions: true });
+    expect(res.results[0].error).toMatch(/did not finish/);
+    await sleep(300);
+    expect(knight.system.attributes.hp.value).toBe(20);
+  });
+
+  it('guard: the same case with the guard off shows the late damage it prevents', async () => {
+    const knight = makeActor('Brakka', [], 20, 16, {}, { reactions: ['Parry'] });
+    world({ targetFeet: 5, target: knight });
+    d20Queue = [15];
+    lateReactionMs = 150;
+    await attackWith(h => (h.midiGuardStoppedWorkflows = false), 'Dagger', ['brakka'], {
+      reactions: true,
+    });
+    await sleep(300);
+    expect(knight.system.attributes.hp.value).toBe(15);
+  });
+});
+
+describe("Midi-QOL's per-call Dice So Nice switches", () => {
+  it('when set, Midi is told not to show (so not to wait for) the 3D dice of the attack and damage rolls', async () => {
+    world({ targetFeet: 5 });
+    await attackWith(h => (h.midiSkipDiceAnimation = true), 'Dagger', ['brakka']);
+    expect(midiCalls[0].usage.midiOptions.workflowOptions).toMatchObject({
+      attackRollDSN: false,
+      damageRollDSN: false,
+    });
+  });
+
+  it('when not set, neither switch is sent (Midi shows the dice as it always did)', async () => {
+    world({ targetFeet: 5 });
+    await attackWith(h => (h.midiSkipDiceAnimation = false), 'Dagger', ['brakka']);
+    const wo = midiCalls[0].usage.midiOptions.workflowOptions;
+    expect(wo.attackRollDSN).toBeUndefined();
+    expect(wo.damageRollDSN).toBeUndefined();
+  });
+});
+
+describe('the same target named twice', () => {
+  it('two weapon attacks at one target: the second starts from the hit points the first left', async () => {
+    world({ targetFeet: 5, dagger: makeDagger(2) });
+    d20Queue = [15, 15];
+    const res = await attack('Dagger', ['brakka', 'brakka']);
+    expect(midiCalls).toHaveLength(2);
+    const [a, b] = res.results;
+    expect(a.hpBefore).toBe(20);
+    expect(b.hpBefore).toBe(a.hpAfter);
+    expect(b.damage).toBe(b.hpBefore - b.hpAfter);
+  });
+
+  it('a spell used once at a target named twice: attacked once, the second said, never counted twice', async () => {
+    const bolt = levelledSpell('Guiding Bolt');
+    const { kobold } = world({ targetFeet: 30, dagger: bolt, attackerItems: [bolt] });
+    kobold.system.spells = { spell1: { value: 2, max: 2 } };
+    d20Queue = [15];
+    const res = await attack('Guiding Bolt', ['brakka', 'brakka']);
+    expect(midiCalls).toHaveLength(1);
+    expect(kobold.system.spells.spell1.value).toBe(1);
+    const again = res.results.filter((r: any) => r.sameTargetAgain);
+    expect(again).toHaveLength(1);
+    expect(again[0].damage).toBe(0);
+    expect(res.results.filter((r: any) => !r.sameTargetAgain)).toHaveLength(1);
+    // the attack's own row comes first (a caller reading the first row reads the attack), the repeat after it
+    expect(res.results[0].sameTargetAgain).toBeUndefined();
+    expect(res.results[1].sameTargetAgain).toBe(true);
+  });
+});
+
+describe("Midi-QOL refuses the use itself (its target count rule): a refusal in Midi's words", () => {
+  it('a one-target spell at two targets: refused, nothing rolled, no slot spent, Midi says why', async () => {
+    midiRefuseOver = 1;
+    const bolt = levelledSpell('Guiding Bolt');
+    const { kobold } = world({
+      targetFeet: 30,
+      dagger: bolt,
+      attackerItems: [bolt],
+      extraTokens: [nimAt(8)],
+    });
+    kobold.system.spells = { spell1: { value: 2, max: 2 } };
+    const res = await attack('Guiding Bolt', ['brakka', 'nim']);
+    expect(res.success).toBe(false);
+    expect(res.refused).toBe(true);
+    expect(kobold.system.spells.spell1.value).toBe(2);
+    expect(res.results).toHaveLength(2);
+    for (const r of res.results) {
+      expect(r.engineRefused).toBe(true);
+      expect(r.hit).toBe(false);
+      expect(r.note).toMatch(/^Midi-QOL did not make the attack: Wrong number of targets/);
+    }
+  });
+
+  it("a SAVE spell at more targets than it takes: refused in Midi's words, never read as 'no damage'", async () => {
+    midiRefuseOver = 1;
+    const whispers = makeWeapon({
+      name: 'Dissonant Whispers',
+      type: 'spell',
+      quantity: 1,
+      level: 1,
+      range: { value: 60, long: null, units: 'ft' },
+      properties: [],
+      attackModes: [],
+      actionType: 'save',
+    });
+    const act = whispers.system.activities.contents[0];
+    act.type = 'save';
+    delete act.attack;
+    act.save = {};
+    const { kobold } = world({
+      targetFeet: 30,
+      dagger: whispers,
+      attackerItems: [whispers],
+      extraTokens: [nimAt(8)],
+    });
+    kobold.system.spells = { spell1: { value: 2, max: 2 } };
+    const res = await attack('Dissonant Whispers', ['brakka', 'nim']);
+    expect(res.success).toBe(false);
+    expect(res.refused).toBe(true);
+    expect(kobold.system.spells.spell1.value).toBe(2);
+    for (const r of res.results) {
+      expect(r.via).toBe('save');
+      expect(r.engineRefused).toBe(true);
+      expect(r.note).toMatch(/^Midi-QOL did not cast it: Wrong number of targets/);
+    }
+  });
+
+  it('guard: the same spell at one target is made', async () => {
+    midiRefuseOver = 1;
+    const bolt = levelledSpell('Guiding Bolt');
+    const { kobold } = world({ targetFeet: 30, dagger: bolt, attackerItems: [bolt] });
+    kobold.system.spells = { spell1: { value: 2, max: 2 } };
+    d20Queue = [15];
+    const res = await attack('Guiding Bolt', ['brakka']);
+    expect(res.success).toBe(true);
+    expect(res.refused).toBeUndefined();
+    expect(kobold.system.spells.spell1.value).toBe(1);
   });
 });

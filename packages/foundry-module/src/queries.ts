@@ -36,6 +36,10 @@ import {
   type CombatToken,
 } from './combat-scoping-utils.js';
 import { staleCombatIdsToDelete } from './combat-cleanup-utils.js';
+
+/** Board #1887 (round 3): execute-attack's default for Midi-QOL's per-call Dice So Nice switches (see
+ * QueryHandlers#midiSkipDiceAnimation). */
+const SKIP_DICE_DEFAULT = false;
 import { AidmModuleHandlers } from './aidm-module-handlers.js';
 import {
   chooseAttackMode,
@@ -50,6 +54,7 @@ import {
   readMidiAttack,
   activitySpendsOnUse,
   spentOnUse,
+  guardStoppedWorkflow,
   MIDI_DEADLINE_MARGIN_MS,
   MIDI_MIN_RUN_MS,
 } from './attack-rules-utils.js';
@@ -2498,6 +2503,19 @@ export class QueryHandlers {
   /** How close to that deadline a Midi run may end, and the least time left worth starting one (tests shorten both). */
   public midiDeadlineMarginMs = MIDI_DEADLINE_MARGIN_MS;
   public midiMinRunMs = MIDI_MIN_RUN_MS;
+  /**
+   * Board #1887 (bridge 0.10.8 round 3, operator popup "Test the option first"): Midi-QOL's own per-call switches
+   * `workflowOptions.attackRollDSN` / `damageRollDSN` false, so Midi neither waits for Dice So Nice's 3D dice in the
+   * headless GM browser nor marks them as already shown (players then get them from the chat message). The value is
+   * the one the test stack's player-browser matrix chose (bridge/README.md, "0019").
+   */
+  public midiSkipDiceAnimation = SKIP_DICE_DEFAULT;
+  /**
+   * Board #1887 (round 3): a workflow execute-attack stopped is guarded so that its own state loop, still waiting in a
+   * reaction prompt or a dice animation, cannot go on to apply damage after the answer said "stopped"
+   * (guardStoppedWorkflow). Only a test turns it off, to show the late damage it prevents.
+   */
+  public midiGuardStoppedWorkflows = true;
 
   private async handleExecuteAttack(data: {
     attacker: string;
@@ -2923,6 +2941,21 @@ export class QueryHandlers {
         });
       }
       let engineStuck: string | null = null;
+      // Board #1887 (round 3): hit points read just before the Midi run that decides the target (as 618a313 did), so a
+      // target named twice starts its second result from the hit points the first left.
+      const _hpNow = (t: any) => t.actor?.system?.attributes?.hp?.value ?? 0;
+      const engineRefusal = (p: Prep, run: any) => ({
+        target: p.t.name,
+        hpBefore: p.hpBefore,
+        hpAfter: _hpNow(p.t),
+        damage: 0,
+        hit: false,
+        via: 'attack',
+        engine: 'midi-qol',
+        engineRefused: true,
+        note: `Midi-QOL did not make the attack: ${run.refusedByEngine}`,
+        engineNotes: run.notes,
+      });
       // One result row per target, the same fields as before (brain 0.65.138 reads them), from one Midi run.
       const rowFor = (p: Prep, run: any, spend0: any, qtyBefore: any, stuckMsg: string | null) => {
         const t = p.t;
@@ -3023,10 +3056,28 @@ export class QueryHandlers {
       const noTime =
         'no time was left in this call (the MCP side waits 60 s for the whole call), so it was not started';
       if (oneUse) {
+        const seen = new Set<string>();
+        const early = new Map<Prep, any>();
         const ready = preps.filter(p => {
+          // Board #1887 (round 3): one use attacks each target once (Midi-QOL rolls one attack per target in a use);
+          // a target named again is said, not attacked again and not counted twice.
+          const key = String(p.t.id ?? p.t.uuid ?? p.t.name);
+          if (seen.has(key)) {
+            early.set(p, {
+              target: p.t.name,
+              hit: false,
+              damage: 0,
+              via: 'attack',
+              engine: 'midi-qol',
+              sameTargetAgain: true,
+              note: `${p.t.name} was named more than once; one use of ${item.name} attacks each target once (Midi-QOL rolls one attack per target), so it was attacked once`,
+            });
+            return false;
+          }
+          seen.add(key);
           // a used-up weapon is still refused (house rule below) even on the one-use path
           if (p.choice.thrown && weaponUsedUp({ type: item.type, quantity: _qtyNow() })) {
-            results.push({
+            early.set(p, {
               target: p.t.name,
               hit: false,
               noWeaponLeft: true,
@@ -3036,13 +3087,15 @@ export class QueryHandlers {
           }
           return true;
         });
+        const made = new Map<Prep, any>();
         if (ready.length) {
           const budget = runBudget();
           if (timeLeft() < this.midiMinRunMs) {
-            for (const p of ready) results.push(notAttacked(p, noTime));
+            for (const p of ready) made.set(p, notAttacked(p, noTime));
           } else {
             const spend0 = _spendNow();
             const qty0 = _qtyNow();
+            for (const p of ready) p.hpBefore = _hpNow(p.t);
             const run = await this._runMidiAttack(
               _M2,
               activity,
@@ -3051,9 +3104,20 @@ export class QueryHandlers {
               { attackMode: ready[0]?.choice.mode, reactions, timeoutMs: budget }
             );
             const stuck = run.timedOut ? stuckWords(run, Math.round(budget / 1000)) : null;
-            for (const p of ready) results.push(rowFor(p, run, spend0, qty0, stuck));
+            for (const p of ready)
+              made.set(
+                p,
+                run.refusedByEngine ? engineRefusal(p, run) : rowFor(p, run, spend0, qty0, stuck)
+              );
           }
         }
+        // the rows in the order the targets were named; a target named again comes after its own row
+        for (const p of preps) {
+          if (made.has(p)) results.push(made.get(p));
+          else if (early.has(p) && !early.get(p).sameTargetAgain) results.push(early.get(p));
+        }
+        for (const p of preps)
+          if (early.has(p) && early.get(p).sameTargetAgain) results.push(early.get(p));
       } else {
         for (const p of preps) {
           // HOUSE RULE (board #1887, bridge 0.10.7; moves to the aidm-rules add-on): a used-up weapon is not thrown.
@@ -3082,6 +3146,7 @@ export class QueryHandlers {
           // a Returning weapon is thrown but dnd5e keeps its quantity, and a roll that failed uses nothing up.
           const qty0 = _qtyNow();
           const spend0 = _spendNow();
+          p.hpBefore = _hpNow(p.t);
           const run = await this._runMidiAttack(_M2, activity, attTok, [p.t], {
             attackMode: p.choice.mode,
             reactions,
@@ -3089,11 +3154,24 @@ export class QueryHandlers {
           });
           const stuck = run.timedOut ? stuckWords(run, Math.round(budget / 1000)) : null;
           if (stuck) engineStuck = stuck;
-          results.push(rowFor(p, run, spend0, qty0, stuck));
+          results.push(
+            run.refusedByEngine ? engineRefusal(p, run) : rowFor(p, run, spend0, qty0, stuck)
+          );
         }
       }
       // A spell attack's slot: dnd5e's own activity.use (inside Midi-QOL's workflow) spends it once, so it is not spent
       // again here (0.10.7 lowered it by hand after its own roll).
+      // Board #1887 (round 3): when Midi-QOL itself refused every attack (nothing was rolled), the call is refused, as
+      // the range refusals above are.
+      const attempted = results.filter((r: any) => r.via === 'attack' && !r.sameTargetAgain);
+      if (attempted.length && attempted.every((r: any) => r.engineRefused))
+        return finish({
+          success: false,
+          attacker: attTok.name,
+          item: item.name,
+          results,
+          refused: true,
+        });
       return finish({ success: true, attacker: attTok.name, item: item.name, results });
     }
 
@@ -3102,8 +3180,14 @@ export class QueryHandlers {
       t.object?.setTarget(true, { user: (game as any).user, releaseOthers: false })
     );
     const before = targetToks.map((t: any) => ({ hp: t.actor?.system?.attributes?.hp?.value }));
+    // Board #1887 (round 3): what dnd5e and Midi-QOL tell the GM while it runs, so a use Midi-QOL itself refuses (its
+    // requiresTargets rule: more targets than the spell takes) is said in its words instead of reading as "no damage".
+    const saveNotes: string[] = [];
+    const restoreNotes = this._captureNotes(saveNotes);
+    let saveWf: any = undefined;
+    let saveThrew = false;
     try {
-      await MidiQOL.completeActivityUse(
+      saveWf = await MidiQOL.completeActivityUse(
         activity,
         {
           midiOptions: {
@@ -3119,6 +3203,30 @@ export class QueryHandlers {
       );
     } catch (e) {
       /* swallow late headless UI throw */
+      saveThrew = true;
+    } finally {
+      restoreNotes();
+    }
+    if (!saveThrew && !saveWf && saveNotes.length) {
+      for (let i = 0; i < targetToks.length; i++)
+        results.push({
+          target: targetToks[i].name,
+          hpBefore: before[i].hp,
+          hpAfter: before[i].hp,
+          damage: 0,
+          via: 'save',
+          engine: 'midi-qol',
+          engineRefused: true,
+          note: `Midi-QOL did not cast it: ${saveNotes.join('; ')}`,
+          engineNotes: saveNotes,
+        });
+      return finish({
+        success: false,
+        attacker: attTok.name,
+        item: item.name,
+        results,
+        refused: true,
+      });
     }
     for (let w = 0; w < 7; w++) {
       await new Promise(r => setTimeout(r, 300));
@@ -3158,46 +3266,12 @@ export class QueryHandlers {
    * What dnd5e and Midi-QOL tell the GM while it runs (ui.notifications, e.g. dnd5e's "no quantity" warning) is kept
    * and returned as `notes`.
    */
-  private async _runMidiAttack(
-    MidiQOL: any,
-    activity: any,
-    attTok: any,
-    targets: any[],
-    opts: { attackMode: string | undefined; reactions: boolean; timeoutMs: number }
-  ): Promise<{
-    wf: any;
-    timedOut: boolean;
-    error: string | null;
-    notes: string[];
-    stuckAt: string | null;
-    dialogs: string[];
-    ms: number;
-  }> {
+  /**
+   * Board #1887: keep what dnd5e and Midi-QOL tell the GM (ui.notifications warn, error and info) in `notes` until the
+   * returned function is called, which puts the GM's own notifications back. Each message still reaches the GM.
+   */
+  private _captureNotes(notes: string[]): () => void {
     const g: any = globalThis as any;
-    const started = Date.now();
-    const notes: string[] = [];
-    const res = {
-      wf: null as any,
-      timedOut: false,
-      error: null as string | null,
-      notes,
-      stuckAt: null as string | null,
-      dialogs: [] as string[],
-      ms: 0,
-    };
-    if (typeof MidiQOL?.completeActivityUse !== 'function') {
-      res.error =
-        "Midi-QOL's completeActivityUse is not available, so the attack could not be made";
-      return res;
-    }
-    const undrawn = targets.filter((t: any) => !t.object);
-    if (undrawn.length) {
-      res.error = `${undrawn.map((t: any) => t.name).join(', ')} is not drawn on the map in the GM's browser, so Midi-QOL cannot target it`;
-      return res;
-    }
-    // The windows already open before this use (the GM browser's own UI), so only the ones this use opens are closed.
-    const appsBefore = new Set<any>([...(g.foundry?.applications?.instances?.values?.() ?? [])]);
-    const v1Before = new Set<any>(Object.values(g.ui?.windows ?? {}));
     const ui = g.ui?.notifications;
     const saved: Record<string, any> = {};
     const say = (msg: any, o: any) => {
@@ -3220,9 +3294,63 @@ export class QueryHandlers {
         };
       }
     }
+    return () => {
+      for (const k of Object.keys(saved)) ui[k] = saved[k];
+    };
+  }
+
+  private async _runMidiAttack(
+    MidiQOL: any,
+    activity: any,
+    attTok: any,
+    targets: any[],
+    opts: { attackMode: string | undefined; reactions: boolean; timeoutMs: number }
+  ): Promise<{
+    wf: any;
+    timedOut: boolean;
+    error: string | null;
+    notes: string[];
+    stuckAt: string | null;
+    dialogs: string[];
+    guarded: string[];
+    refusedByEngine: string | null;
+    ms: number;
+  }> {
+    const g: any = globalThis as any;
+    const started = Date.now();
+    const notes: string[] = [];
+    const res = {
+      wf: null as any,
+      timedOut: false,
+      error: null as string | null,
+      notes,
+      stuckAt: null as string | null,
+      dialogs: [] as string[],
+      guarded: [] as string[],
+      refusedByEngine: null as string | null,
+      ms: 0,
+    };
+    if (typeof MidiQOL?.completeActivityUse !== 'function') {
+      res.error =
+        "Midi-QOL's completeActivityUse is not available, so the attack could not be made";
+      return res;
+    }
+    const undrawn = targets.filter((t: any) => !t.object);
+    if (undrawn.length) {
+      res.error = `${undrawn.map((t: any) => t.name).join(', ')} is not drawn on the map in the GM's browser, so Midi-QOL cannot target it`;
+      return res;
+    }
+    // The windows already open before this use (the GM browser's own UI), so only the ones this use opens are closed.
+    const appsBefore = new Set<any>([...(g.foundry?.applications?.instances?.values?.() ?? [])]);
+    const v1Before = new Set<any>(Object.values(g.ui?.windows ?? {}));
+    const restoreNotes = this._captureNotes(notes);
     const usage = {
       midiOptions: {
-        ...midiAttackOptions({ attackMode: opts.attackMode, reactions: opts.reactions }),
+        ...midiAttackOptions({
+          attackMode: opts.attackMode,
+          reactions: opts.reactions,
+          skipDiceAnimation: this.midiSkipDiceAnimation,
+        }),
         targetsToUse: new Set(targets.map((t: any) => t.object)),
       },
     };
@@ -3244,7 +3372,7 @@ export class QueryHandlers {
       res.error = `Midi-QOL's attack workflow failed: ${String((e && (e.message || e)) || e)}`;
     } finally {
       clearTimeout(timer);
-      for (const k of Object.keys(saved)) ui[k] = saved[k];
+      restoreNotes();
     }
     if (res.timedOut) {
       // Stop what is stuck: the workflow for this activity that has not finished, and any roll or reaction window.
@@ -3261,6 +3389,9 @@ export class QueryHandlers {
         );
         for (const w of mine) {
           res.stuckAt = String(w.currentAction?.name ?? '').replace(/^bound /, '') || res.stuckAt;
+          // Board #1887 (round 3): its own state loop may still be waiting (a reaction prompt, a dice animation); from
+          // any state it enters next it goes to Abort, so no damage lands after this answer says "stopped".
+          if (this.midiGuardStoppedWorkflows) res.guarded = guardStoppedWorkflow(w);
           try {
             w.aborted = true;
             if (typeof w.performState === 'function') await w.performState(w.WorkflowState_Abort);
@@ -3295,6 +3426,10 @@ export class QueryHandlers {
         /* no window list; nothing to close */
       }
     }
+    // Board #1887 (round 3): Midi-QOL refused the use itself (no workflow, no error, no timeout), e.g. more targets
+    // than the spell takes when its `requiresTargets` rule is on; its own warning says why.
+    if (!res.timedOut && !res.error && !res.wf && notes.length)
+      res.refusedByEngine = notes.join('; ');
     res.ms = Date.now() - started;
     return res;
   }

@@ -100,11 +100,6 @@ export class CombatTools {
               items: { type: 'string' },
               description: 'Target token name(s) or id(s).',
             },
-            reactions: {
-              type: 'boolean',
-              description:
-                "Optional: let Midi-QOL offer the target's reactions (Shield, Parry). Off by default: Midi-QOL 14.0.12 needs the DAE add-on for them, and a reaction prompt waits for someone to answer.",
-            },
           },
           required: ['attacker', 'item', 'targets'],
         },
@@ -136,7 +131,8 @@ export class CombatTools {
         item: args?.item,
         targets: args?.targets || [],
         ...(args?.itemId ? { itemId: args.itemId } : {}),
-        ...(args?.reactions === true ? { reactions: true } : {}),
+        // Board #1887 (round 3, operator popup "With the chooser"): reactions stay OFF until the aidm-rules reaction
+        // chooser exists; the model is not offered them and cannot pass them (the add-on's handler keeps the switch).
       })
     );
   }

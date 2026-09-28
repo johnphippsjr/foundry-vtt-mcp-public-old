@@ -236,6 +236,9 @@ export interface MidiAttackOptionsInput {
   attackMode?: string | undefined;
   /** Let Midi-QOL run reactions (Shield, Parry). Off unless the caller asks; see midiAttackOptions. */
   reactions?: boolean | undefined;
+  /** Midi-QOL does not show (and so does not wait for) Dice So Nice's 3D dice for this attack's attack and damage
+   * rolls (its own per-call `workflowOptions.attackRollDSN` / `damageRollDSN`); see midiAttackOptions. */
+  skipDiceAnimation?: boolean | undefined;
 }
 
 /**
@@ -251,7 +254,12 @@ export interface MidiAttackOptionsInput {
  *   worlds do not run DAE. When a target has a usable reaction (a Knight's Parry, on a hit), Midi asks the robot GM,
  *   waits its reactionTimeout (10 s), then crashes in `doReactions` (`globalThis.DAE.actionQueue` of an undefined DAE)
  *   and never applies the damage. 0.10.7 never ran reactions either, so this keeps today's game; turning them on is
- *   the operator's decision.
+ *   the operator's decision. (2026-09-28: with DAE the crash is gone; the operator ruled reactions stay OFF until the
+ *   aidm-rules reaction chooser exists, popup "With the chooser".)
+ * - workflowOptions.attackRollDSN / damageRollDSN false (when `skipDiceAnimation`): Midi-QOL's own per-call switches
+ *   (AttackActivity.ts 562, MidiActivityMixin.ts 1316-1328). Midi then neither WAITS for Dice So Nice's animation on
+ *   the rolling client (the headless GM browser, where it takes seconds or never ends) nor marks the dice as already
+ *   shown (its displayDSNForRoll ends with DSNMarkDiceDisplayed), so Dice So Nice shows them from the chat message.
  */
 export function midiAttackOptions(input: MidiAttackOptionsInput): {
   autoRollAttack: true;
@@ -263,6 +271,10 @@ export function midiAttackOptions(input: MidiAttackOptionsInput): {
   const workflowOptions: Record<string, unknown> = { targetConfirmation: 'none' };
   if (input.attackMode) workflowOptions.attackMode = input.attackMode;
   if (!input.reactions) workflowOptions.noProvokeReaction = true;
+  if (input.skipDiceAnimation) {
+    workflowOptions.attackRollDSN = false;
+    workflowOptions.damageRollDSN = false;
+  }
   return {
     autoRollAttack: true,
     fastForwardAttack: true,
@@ -542,4 +554,52 @@ export function spentOnUse(before: SpendState, after: SpendState): { any: boolea
   const a = dropped(before.activityUses, after.activityUses);
   if (a) parts.push(a === 1 ? 'a use of the action' : `${a} uses of the action`);
   return { any: parts.length > 0, words: parts.join(' and ') };
+}
+
+// ================================================================================================
+// Bridge 0.10.8 round 3 (board #1887): a workflow the bridge stopped must not go on to apply damage later.
+// ================================================================================================
+
+/**
+ * The Midi-QOL 14.0.12 workflow states that roll or apply something after the attack roll. When execute-attack stops a
+ * stuck workflow it calls `performState(WorkflowState_Abort)`, but the workflow's OWN state loop may still be waiting
+ * inside a state (a reaction prompt of 10 s, a Dice So Nice animation). When that wait ends, Midi's loop runs the next
+ * state it was handed even though `aborted` is set (Workflow.ts `performState`: while aborting it skips only the hooks)
+ * and `WorkflowState_AllRollsComplete` has no abort check, so the damage would land after the answer said "stopped".
+ */
+export const MIDI_STATES_AFTER_STOP: readonly string[] = [
+  'WorkflowState_AttackRollComplete',
+  'WorkflowState_WaitForDamageRoll',
+  'WorkflowState_ConfirmRoll',
+  'WorkflowState_DamageRollComplete',
+  'WorkflowState_WaitForSaves',
+  'WorkflowState_SavesComplete',
+  'WorkflowState_AllRollsComplete',
+  'WorkflowState_ApplyDynamicEffects',
+  'WorkflowState_RollFinished',
+];
+
+/**
+ * Make a stopped Midi-QOL workflow go to its own Abort state from any state it would enter next. Midi's states hand
+ * over the next state as `this.WorkflowState_X`, read from the workflow object, so an own property on this one
+ * workflow object replaces each later state with one that answers "abort" (Midi's Abort then runs Cleanup and
+ * Completed, which are left alone). Nothing else, and no other workflow, is touched. Returns the states replaced.
+ */
+export function guardStoppedWorkflow(wf: any): string[] {
+  const done: string[] = [];
+  if (!wf || typeof wf !== 'object') return done;
+  for (const name of MIDI_STATES_AFTER_STOP) {
+    if (typeof wf[name] !== 'function') continue;
+    const toAbort = async function (this: any) {
+      return (this ?? wf).WorkflowState_Abort;
+    };
+    try {
+      Object.defineProperty(wf, name, { value: toAbort, configurable: true, writable: true });
+      done.push(name);
+    } catch (e) {
+      /* a frozen workflow object: nothing to guard */
+    }
+  }
+  wf.aidmStoppedByBridge = true;
+  return done;
 }

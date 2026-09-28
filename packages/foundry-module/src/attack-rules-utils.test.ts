@@ -17,6 +17,8 @@ import {
   readMidiAttack,
   activitySpendsOnUse,
   spentOnUse,
+  guardStoppedWorkflow,
+  MIDI_STATES_AFTER_STOP,
 } from './attack-rules-utils.js';
 
 const DAGGER = ['oneHanded', 'offhand', null, 'thrown', 'thrown-offhand'];
@@ -431,5 +433,53 @@ describe('spentOnUse: what a use spent, in plain words', () => {
     });
     expect(spentOnUse({ ...n, slot: 1 }, { ...n, slot: 1 })).toEqual({ any: false, words: '' });
     expect(spentOnUse(n, n).any).toBe(false);
+  });
+});
+
+// Board #1887 (bridge 0.10.8 round 3)
+describe('midiAttackOptions: the per-call Dice So Nice switches', () => {
+  it('skipDiceAnimation sends attackRollDSN and damageRollDSN false', () => {
+    const wo = midiAttackOptions({
+      attackMode: 'oneHanded',
+      skipDiceAnimation: true,
+    }).workflowOptions;
+    expect(wo.attackRollDSN).toBe(false);
+    expect(wo.damageRollDSN).toBe(false);
+  });
+  it('without it neither switch is sent', () => {
+    const wo = midiAttackOptions({ attackMode: 'oneHanded' }).workflowOptions;
+    expect('attackRollDSN' in wo).toBe(false);
+    expect('damageRollDSN' in wo).toBe(false);
+  });
+});
+
+describe('guardStoppedWorkflow: a stopped workflow goes to Abort from any later state', () => {
+  it('every later state of THIS workflow answers Abort; Abort, Cleanup and other workflows are untouched', async () => {
+    class Wf {
+      WorkflowState_Abort = { name: 'abort' };
+      async WorkflowState_AllRollsComplete() {
+        return 'applied damage';
+      }
+      async WorkflowState_Cleanup() {
+        return 'cleanup';
+      }
+    }
+    const a: any = new Wf();
+    const b: any = new Wf();
+    const guarded = guardStoppedWorkflow(a);
+    expect(guarded).toContain('WorkflowState_AllRollsComplete');
+    expect(await a.WorkflowState_AllRollsComplete.call(a)).toBe(a.WorkflowState_Abort);
+    expect(await a.WorkflowState_Cleanup()).toBe('cleanup');
+    expect(await b.WorkflowState_AllRollsComplete()).toBe('applied damage');
+    expect(a.aidmStoppedByBridge).toBe(true);
+  });
+  it('lists the states that roll or apply something, and never Abort, Cleanup or Completed', () => {
+    expect(MIDI_STATES_AFTER_STOP).toContain('WorkflowState_AllRollsComplete');
+    expect(MIDI_STATES_AFTER_STOP).toContain('WorkflowState_ApplyDynamicEffects');
+    for (const s of ['WorkflowState_Abort', 'WorkflowState_Cleanup', 'WorkflowState_Completed'])
+      expect(MIDI_STATES_AFTER_STOP).not.toContain(s);
+  });
+  it('nothing to guard on a missing workflow', () => {
+    expect(guardStoppedWorkflow(null)).toEqual([]);
   });
 });
