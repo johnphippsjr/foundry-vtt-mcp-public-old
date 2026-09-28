@@ -85,6 +85,8 @@ let otherToast = '';
 // caster's chosen effect
 let midiAbortSaveSilently = false;
 let midiDropsChosenEffect = false;
+// round 6: the GM browser's map drawn or not (canvas.ready)
+let canvasReady = true;
 
 function getProperty(obj: any, path: string) {
   return path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
@@ -352,6 +354,7 @@ function install(toks: Tok[]) {
     },
   };
   g.canvas = {
+    ready: canvasReady,
     dimensions: { distance: FT },
     // Foundry 14's TokenLayer#setTargets (the call Midi-QOL's updateUserTargets makes): the GM's targets become
     // exactly these tokens
@@ -844,6 +847,7 @@ beforeEach(() => {
   otherToast = '';
   midiAbortSaveSilently = false;
   midiDropsChosenEffect = false;
+  canvasReady = true;
 });
 
 describe("bridge 0.10.8: the attack is Midi-QOL's own workflow (engine map M07)", () => {
@@ -2622,8 +2626,8 @@ describe('round 5, item 4: several effects are a choice ONLY where the data says
     expect(res.results[0].note).toMatch(/its data does not say how they apply/);
   });
 
-  it("Mirror Image (range self, three duplicates): the caster's own effects, all three on the caster", async () => {
-    const { sp } = choiceSpell(
+  it("Mirror Image, its data marking ALL effects (aidm-rules' allEffects): all three duplicates on the caster", async () => {
+    const { sp, act } = choiceSpell(
       'Mirror Image',
       2,
       [
@@ -2635,6 +2639,7 @@ describe('round 5, item 4: several effects are a choice ONLY where the data says
       false
     );
     sp.system.range = { units: 'self' };
+    sp.flags['aidm-rules'] = { allEffects: [act.id] };
     const { kobold } = world({ targetFeet: 5, dagger: sp, attackerItems: [sp] });
     kobold.system.spells = { spell2: { value: 1, max: 1 } };
     kobold.createEmbeddedDocuments = async (_t: string, docs: any[]) => {
@@ -2807,5 +2812,116 @@ describe("round 5, item 7: the slot a spell spends is dnd5e's (a warlock's pact 
     const res = await attack('Shield of Faith', ['kobold']);
     expect(res.success).toBe(false);
     expect(res.error).toBe('No level-1 spell slots remaining');
+  });
+});
+
+// ================================================================================================
+// Board #1887 (bridge 0.10.8 round 6): the re-review of 8a6b35e
+// ================================================================================================
+
+describe('round 6, item 3: all of several effects apply only where the data marks it, never because the range is self', () => {
+  it("an Imp's shapes (range self, three forms, nothing marked): refused, never all forms at once", async () => {
+    const { sp } = choiceSpell(
+      'Shapechanger',
+      0,
+      [
+        ['fr', 'Rat Form', []],
+        ['fv', 'Raven Form', []],
+        ['fs', 'Spider Form', []],
+      ],
+      'utility',
+      false
+    );
+    sp.type = 'feat';
+    sp.system.range = { units: 'self' };
+    const { kobold } = world({ targetFeet: 5, dagger: sp, attackerItems: [sp] });
+    kobold.createEmbeddedDocuments = async () => {
+      throw new Error('no form may be applied');
+    };
+    const res = await attack('Shapechanger', ['kobold']);
+    expect(res.refused).toBe(true);
+    expect(res.results[0]).toMatchObject({
+      needsData: true,
+      effectsListed: ['Rat Form', 'Raven Form', 'Spider Form'],
+    });
+  });
+});
+
+describe("round 6, item 8: the GM's map not drawn yet is a retryable answer, never a sight refusal", () => {
+  it('Foundry just started (canvas not ready): nothing used, retryable, no "no line of sight"', async () => {
+    canvasReady = false;
+    const { sp } = saveSpell('Sacred Flame', 0);
+    world({ targetFeet: 30, dagger: sp, attackerItems: [sp] });
+    const res = await attack('Sacred Flame');
+    expect(res.success).toBe(false);
+    expect(res.retryable).toBe(true);
+    expect(res.error).toMatch(/not drawn in the GM's browser yet/);
+    expect(midiCalls).toHaveLength(0);
+    expect(res.results).toBeUndefined();
+  });
+
+  it('a token not drawn yet: retryable, names it, nothing used', async () => {
+    const { sp } = saveSpell('Sacred Flame', 0);
+    world({ targetFeet: 30, dagger: sp, attackerItems: [sp] });
+    tokens.get('brakka').object = null;
+    const res = await attack('Sacred Flame');
+    expect(res.retryable).toBe(true);
+    expect(res.error).toMatch(/has not drawn Brakka yet/);
+    expect(midiCalls).toHaveLength(0);
+  });
+});
+
+describe("round 6, nit 10: an area use is refused when the GM's targets cannot be set", () => {
+  it('no canvas.tokens.setTargets: a breath weapon is not used at all', async () => {
+    const { sp, act } = saveSpell('Fire Breath', 0);
+    act.target = { template: { type: 'line', size: 15 }, affects: {} };
+    const { brakka } = world({ targetFeet: 10, dagger: sp, attackerItems: [sp] });
+    delete (globalThis as any).canvas.tokens.setTargets;
+    const res = await attack('Fire Breath');
+    expect(midiCalls).toHaveLength(0);
+    expect(res.success).toBe(false);
+    expect(res.results[0].error).toMatch(/not used: the GM browser's targets could not be set/);
+    expect(brakka.system.attributes.hp.value).toBe(20);
+  });
+
+  it('guard: a single-target save goes on with a rule warning', async () => {
+    const { sp } = saveSpell('Sacred Flame', 0);
+    world({ targetFeet: 30, dagger: sp, attackerItems: [sp] });
+    delete (globalThis as any).canvas.tokens.setTargets;
+    const res = await attack('Sacred Flame');
+    expect(midiCalls).toHaveLength(1);
+    expect(res.ruleWarnings?.[0]).toMatch(/targets could not be set/);
+  });
+});
+
+describe("round 6, nit 11: a recast replaces the caster's own effect, never stacks it", () => {
+  it("two casts leave ONE of the caster's own effect", async () => {
+    const { sp, act } = choiceSpell(
+      'Hunter Sense',
+      1,
+      [['hs', 'Marked Quarry', []]],
+      'utility',
+      false
+    );
+    const own = effectOf(sp.id, 'own', 'Hunting', []);
+    (own as any).flags = { dae: { selfTarget: true } };
+    act.effects.push({ _id: 'own', effect: own, onSave: false, level: { min: null, max: null } });
+    const { kobold, brakka } = world({ targetFeet: 5, dagger: sp, attackerItems: [sp] });
+    kobold.system.spells = { spell1: { value: 3, max: 3 } };
+    for (const a of [kobold, brakka]) {
+      a.createEmbeddedDocuments = async (_t: string, docs: any[]) => {
+        const made = docs.map(d => ({ ...d, id: `${d.name}-${a.effects.length}` }));
+        a.effects.push(...made);
+        return made;
+      };
+      a.deleteEmbeddedDocuments = async (_t: string, ids: string[]) => {
+        a.effects = a.effects.filter((e: any) => !ids.includes(e.id));
+        return ids;
+      };
+    }
+    await attack('Hunter Sense');
+    await attack('Hunter Sense');
+    expect(kobold.effects.map((e: any) => e.name)).toEqual(['Hunting']);
+    expect(brakka.effects.map((e: any) => e.name)).toEqual(['Marked Quarry']);
   });
 });

@@ -36,6 +36,7 @@ import {
   spellSlotKey,
   consumedDeltas as consumedDeltas5,
   activitySpendsOnUse as spendsOnUse5,
+  effectsAllApply,
 } from './attack-rules-utils.js';
 
 const DAGGER = ['oneHanded', 'offhand', null, 'thrown', 'thrown-offhand'];
@@ -736,5 +737,15 @@ describe('round 5: the activity list, the data-marked choice, the slot a use spe
     expect(d.actor).toEqual([{ keyPath: 'system.spells.pact.value', delta: -1 }]);
     expect(spendsOnUse5({}, {}, true)).toBe(true);
     expect(spendsOnUse5({}, {}, false)).toBe(false);
+  });
+});
+
+describe("round 6: all of several effects apply only where the item's data lists the activity", () => {
+  it('flags.aidm-rules.allEffects lists the activity id', () => {
+    const act = { id: 'a1' };
+    expect(effectsAllApply({ flags: { 'aidm-rules': { allEffects: ['a1'] } } }, act)).toBe(true);
+    expect(effectsAllApply({ flags: { 'aidm-rules': { allEffects: ['a2'] } } }, act)).toBe(false);
+    expect(effectsAllApply({ flags: {} }, act)).toBe(false);
+    expect(effectsAllApply({}, {})).toBe(false);
   });
 });

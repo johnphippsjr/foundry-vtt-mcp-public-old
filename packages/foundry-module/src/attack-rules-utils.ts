@@ -70,8 +70,8 @@ function usableModes(modes: Array<string | null | undefined>): string[] {
 /**
  * Which dnd5e attack mode an attack uses.
  *
- * Rules (PHB 2024, "Thrown"): a weapon with the Thrown property can be thrown to make a ranged
- * attack. A melee weapon's reach is the only way to hit without throwing it, so a target beyond the
+ * Rules (the 2024 Thrown property, in our own words): such a weapon may leave the hand and strike at
+ * range. A melee weapon's reach is the only way to hit without throwing it, so a target beyond the
  * weapon's reach is attacked by throwing it, and a target within reach is attacked in melee (the
  * weapon is kept). This is the same test Midi-QOL's own workflow uses to decide whether a thrown
  * weapon is being used in melee: distance with walls ignored, compared with `range.reach ?? 5`.
@@ -855,6 +855,16 @@ export function activityEffectChoices(activity: any, level?: number | null): Eff
  */
 export function effectsNeedChoice(activity: any): boolean {
   return activity?.midiProperties?.chooseEffects === true;
+}
+
+/**
+ * Round 6 (item 3 of the re-review): ALL of an activity's several effects apply only where the data says so: the item's
+ * `flags.aidm-rules.allEffects` lists the activity's id (the marker the aidm-rules add-on writes next to its
+ * `chooseEffects` record; KNOWN-ISSUES 256). Mirror Image's three duplicates are the case.
+ */
+export function effectsAllApply(item: any, activity: any): boolean {
+  const ids = item?.flags?.['aidm-rules']?.allEffects;
+  return Array.isArray(ids) && !!activity?.id && ids.includes(activity.id);
 }
 
 /** What the answer says when several effects are listed and the data does not say how they apply. */

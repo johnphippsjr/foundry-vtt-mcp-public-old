@@ -60,6 +60,7 @@ import {
   activityEffectChoices,
   activityEffectDocs,
   effectsNeedChoice,
+  effectsAllApply,
   effectsUnclearWords,
   spellSlotKey,
   pickEffectChoice,
@@ -2724,6 +2725,32 @@ export class QueryHandlers {
     // The DM/LLM cannot bypass rules. Midi's own checkActivityRange enforces the item's range/reach
     // AND any feats/effects that modify it (e.g. Spell Sniper doubling range); canSee enforces line
     // of sight (walls). Melee that is out of reach walks into reach first (5e move+attack).
+    // Board #1887 (round 6, item 8 of the re-review; KNOWN-ISSUES 251): Midi's sight check needs the tokens DRAWN
+    // (canSenseModes returns nothing for a missing token, utils.ts 8170-8172), and right after a Foundry restart the
+    // headless GM browser's map may not be drawn yet: that is a retryable answer, never a rules refusal. When it is
+    // drawn, perception is flushed first so every token's vision exists before the check.
+    {
+      const _cv: any = (globalThis as any).canvas;
+      const undrawnNow = [attTok, ...targetToks]
+        .filter((t: any) => !t?.object)
+        .map((t: any) => t.name);
+      if (!_cv?.ready || undrawnNow.length)
+        return finish({
+          success: false,
+          retryable: true,
+          attacker: attTok.name,
+          item: item.name,
+          error: !_cv?.ready
+            ? "the map is not drawn in the GM's browser yet (Foundry has just started); nothing was used, try again in a few seconds"
+            : `the map in the GM's browser has not drawn ${undrawnNow.join(', ')} yet; nothing was used, try again in a few seconds`,
+        });
+      try {
+        _cv.perception?.update?.({ initializeVision: true, refreshVision: true });
+        _cv.perception?.applyRenderFlags?.();
+      } catch (e) {
+        warnRule("the GM browser's perception could not be refreshed before the sight check", e);
+      }
+    }
     {
       const _M: any = (globalThis as any).MidiQOL;
       const _rng: any = item.system.range || {};
@@ -2923,14 +2950,12 @@ export class QueryHandlers {
           isHeal || (!isBuff && !midiApplies)
             ? []
             : activityEffectChoices(activity, item.type === 'spell' ? spellLevel : null);
-        // Round 5: an activity whose only target is its caster (range self, no area; Mirror Image's three
-        // duplicates): its effects are the caster's own and all apply, as Midi-QOL applies them (aidm-rules 0.1.3's
-        // design, section 3.6: "the bridge's lane"). A caster's own choice (Fire Shield) is marked in the data.
-        const casterOnly =
-          !activity?.target?.template?.type &&
-          (activity?.target?.affects?.type === 'self' ||
-            (item.system?.range?.units ?? activity?.range?.units) === 'self');
-        if (choices.length > 1 && !effectsNeedChoice(activity) && !casterOnly) {
+        // Round 6 (item 3 of the re-review): ALL of several effects apply only where the DATA says so (the item's
+        // flags.aidm-rules.allEffects lists the activity: Mirror Image's three duplicates). Round 5 applied all for any
+        // activity whose only target was its caster, which in dnd5e 5.3.3's data would give an Imp all its forms at
+        // once, all 13 of Superior Hunter's Defense's resistances, and both Fire Shields where unmarked.
+        const allApply = effectsAllApply(item, activity);
+        if (choices.length > 1 && !effectsNeedChoice(activity) && !allApply) {
           // Round 5: several effects are a choice ONLY where the data says so (Midi's chooseEffects); otherwise the
           // data does not say how they apply, and they are never all applied (the re-review of round 4).
           refusal = {
@@ -3043,6 +3068,11 @@ export class QueryHandlers {
             delete o._id;
             return o;
           });
+          // round 6 (nit 11): a recast replaces the caster's same-named effects, as on the targets, never stacks them
+          const ownDupes = (attTok.actor.effects || [])
+            .filter((e: any) => own.some((n: any) => n.name === e.name))
+            .map((e: any) => e.id);
+          if (ownDupes.length) await attTok.actor.deleteEmbeddedDocuments('ActiveEffect', ownDupes);
           await attTok.actor.createEmbeddedDocuments('ActiveEffect', own);
         } catch (e) {
           warnRule(`${item.name}'s effect on its caster could not be applied`, e);
@@ -3677,15 +3707,24 @@ export class QueryHandlers {
       return false;
     };
     let targetsSet = false;
+    let targetsProblem = '';
     try {
       targetsSet = setTargets(namedIds);
-      if (!targetsSet)
-        res.ruleWarnings.push(
-          "the GM browser's targets could not be set to the named ones (no canvas.tokens.setTargets), so an area activity may use other targets"
-        );
+      if (!targetsSet) targetsProblem = 'no canvas.tokens.setTargets';
     } catch (e: any) {
+      targetsProblem = String(e?.message ?? e);
+    }
+    if (!targetsSet) {
+      // Round 6 (nit 10): an AREA activity takes the GM's current targets, so it is not used at all when they cannot
+      // be set to the named ones (it would hit whoever else is targeted); any other use goes on with a rule warning.
+      if (activity?.target?.template?.type) {
+        restoreNotes();
+        res.error = `not used: the GM browser's targets could not be set to the named ones (${targetsProblem}), and an area activity would hit whoever else is targeted`;
+        res.ms = Date.now() - started;
+        return res;
+      }
       res.ruleWarnings.push(
-        `the GM browser's targets could not be set to the named ones: ${String(e?.message ?? e)}`
+        `the GM browser's targets could not be set to the named ones (${targetsProblem})`
       );
     }
     const TIMEOUT = Symbol('timeout');
